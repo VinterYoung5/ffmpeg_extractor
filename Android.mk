@@ -31,7 +31,8 @@ LOCAL_MODULE := libffmpegextractor
 LOCAL_MODULE_TAGS := optional
 
 LOCAL_CFLAGS += -D__STDC_CONSTANT_MACROS=1
-
+LOCAL_CFLAGS +=-Wno-date-time
+LOCAL_CFLAGS +=-Wno-error=date-time
 #ifeq ($(TARGET_ARCH),arm)
 #	LOCAL_CFLAGS += -fpermissive
 #endif

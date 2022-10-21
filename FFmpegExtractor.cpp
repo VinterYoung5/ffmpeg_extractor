@@ -706,7 +706,7 @@ static bool LegacySniffFFMPEG(DataSourceHelper *source, float *confidence,const 
     if (source->readAt(offset, hdr, 8) < 8) {
         return false;
     }
-    ALOGE("[%s %d]source head:0x%x 0x%x",__FUNCTION__,__LINE__, hdr[0],hdr[1]);
+    //ALOGE("[%s %d]source head:0x%x 0x%x",__FUNCTION__,__LINE__, hdr[0],hdr[1]);
 
     ret = SniffFFMPEGCommon(url, confidence);
     if (ret) {
@@ -720,7 +720,7 @@ static CreatorFunc Sniff(
         CDataSource *source, float *confidence, void **,
         FreeMetaFunc *) {
     DataSourceHelper helper(source);
-    ALOGE("[%s %d]yangwen source :%p ",__FUNCTION__,__LINE__, source->handle);
+    ALOGE("[%s %d] [%s %s]yangwen source :%p ",__FUNCTION__,__LINE__,__DATE__,__TIME__, source->handle);
     char url[PATH_MAX] = {0};
     snprintf(url, sizeof(url), "android:%p", source->handle);
     //snprintf(url, sizeof(url), "file:%p", source->handle);
