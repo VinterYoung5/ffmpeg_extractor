@@ -43,6 +43,15 @@
 
 #include "FFmpegExtractor.h"
 
+#include "android/log.h"
+#define FF_LOG_TAG               "starFFmpeg"
+#define FF_LOG_VERBOSE            ANDROID_LOG_VERBOSE
+#define FF_LOG_DEBUG              ANDROID_LOG_DEBUG
+#define FF_LOG_INFO               ANDROID_LOG_INFO
+#define FF_LOG_WARN               ANDROID_LOG_WARN
+#define FF_LOG_ERROR              ANDROID_LOG_ERROR
+#define FF_LOG_FATAL              ANDROID_LOG_FATAL
+#define FFLOG(level, TAG, ...)    ((void)__android_log_print(level, TAG, __VA_ARGS__)
 
 #define EXTRACTOR_MAX_PROBE_PACKETS 200
 enum {
@@ -584,19 +593,43 @@ int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block)
     return ret;
 }
 
+static void ffmpeg_log_to_android_callback(void *ptr, int level, const char *fmt, va_list vl)
+{
+    int loglevel = FF_LOG_VERBOSE;
+    if (level <= AV_LOG_ERROR)
+        loglevel = FF_LOG_ERROR;
+    else if (level <= AV_LOG_WARNING)
+        loglevel = FF_LOG_WARN;
+    else if (level <= AV_LOG_INFO)
+        loglevel = FF_LOG_INFO;
+    else if (level <= AV_LOG_VERBOSE)
+        loglevel = FF_LOG_VERBOSE;
+    else
+        loglevel = FF_LOG_DEBUG;
+
+    va_list vl2;
+    char line[1024];
+    static int print_prefix = 1;
+
+    va_copy(vl2, vl);
+    av_log_format_line(ptr, level, fmt, vl2, line, sizeof(line), &print_prefix);
+    va_end(vl2);
+    FFLOG(loglevel, FF_LOG_TAG, "%s", line);
+}
 media_status_t initFFmpeg() 
 {
     media_status_t ret = AMEDIA_OK;
-
+    av_log_set_level(AV_LOG_ERROR);
+    av_log_set_callback(ffmpeg_log_to_android_callback);
+/*
     pthread_mutex_lock(&s_init_mutex);
     if(s_ref_count == 0) {
 
-        /* register all codecs, demux and protocols */
+
         //avcodec_register_all();
         //av_register_all();
         //avformat_network_init();
 
-        /* register android source */
         //ffmpeg_register_android_source();
 
 //        if (av_lockmgr_register(lockmgr)) {
@@ -609,23 +642,23 @@ media_status_t initFFmpeg()
     s_ref_count++;
 
     pthread_mutex_unlock(&s_init_mutex);
-
+*/
     return ret;
 }
 
 void deInitFFmpeg()
 {
-    pthread_mutex_lock(&s_init_mutex);
-
-    // update counter
-    s_ref_count--;
-
-    if(s_ref_count == 0) {
-        av_lockmgr_register(NULL);
-        avformat_network_deinit();
-    }
-
-    pthread_mutex_unlock(&s_init_mutex);
+//    pthread_mutex_lock(&s_init_mutex);
+//
+//    // update counter
+//    s_ref_count--;
+//
+//    if(s_ref_count == 0) {
+//        av_lockmgr_register(NULL);
+//        avformat_network_deinit();
+//    }
+//
+//    pthread_mutex_unlock(&s_init_mutex);
 }
 
 static bool SniffFFMPEGCommon(const char *url, float *confidence)
@@ -690,7 +723,7 @@ fail:
         avformat_close_input(&ic);
     }
     if (status == OK) {
-        deInitFFmpeg();
+        //deInitFFmpeg();
     }
 
     return ret;
