@@ -51,7 +51,7 @@
 #define FF_LOG_WARN               ANDROID_LOG_WARN
 #define FF_LOG_ERROR              ANDROID_LOG_ERROR
 #define FF_LOG_FATAL              ANDROID_LOG_FATAL
-#define FFLOG(level, TAG, ...)    ((void)__android_log_print(level, TAG, __VA_ARGS__)
+#define FFLOG(level, TAG, ...)    ((void)__android_log_print(level, TAG, __VA_ARGS__))
 
 #define EXTRACTOR_MAX_PROBE_PACKETS 200
 enum {
