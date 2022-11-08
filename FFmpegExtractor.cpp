@@ -904,7 +904,6 @@ static bool SniffFFMPEGLocal(DataSourceHelper *source, float *confidence)
     ic->pb = avio;
 
     err = avformat_open_input(&ic, NULL, NULL, NULL);
-    //err = avformat_open_input(&ic, "file:/storage/emulated/0/test.mp4", NULL, NULL);
     if (err < 0) {
         ALOGE("avformat_open_input failed, err:%s", av_err2str(err));
         ret = false;
@@ -913,16 +912,19 @@ static bool SniffFFMPEGLocal(DataSourceHelper *source, float *confidence)
 
     //opts = setup_find_stream_info_opts(ic, codec_opts);
     nb_streams = ic->nb_streams;
+    //add by Vinter, limit timecost when find stream info
+    ic->probesize = 1024 * 1024;
+    ic->max_analyze_duration = AV_TIME_BASE;
     err = avformat_find_stream_info(ic, opts);
     if (err < 0) {
         ALOGE("could not find stream info, err:%s", av_err2str(err));
         ret = false;
         goto fail;
     }
-    for (i = 0; i < nb_streams; i++) {
-        av_dict_free(&opts[i]);
-    }
-    av_freep(&opts);
+//    for (i = 0; i < nb_streams; i++) {
+//        av_dict_free(&opts[i]);
+//    }
+//    av_freep(&opts);
 
     av_dump_format(ic, 0, 0, 0);
 
