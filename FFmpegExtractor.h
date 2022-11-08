@@ -30,7 +30,6 @@ extern "C" {
 //#include "config.h"
 #include "libavformat/avformat.h"
 #include "libavcodec/avcodec.h"
-
 #include "libavutil/avstring.h"
 //#include "libavutil/colorspace.h"
 #include "libavutil/mathematics.h"
@@ -40,7 +39,6 @@ extern "C" {
 #include "libavutil/parseutils.h"
 #include "libavutil/samplefmt.h"
 #include "libavutil/avassert.h"
-#include "libavformat/avformat.h"
 //#include "libavdevice/avdevice.h"
 #include "libswscale/swscale.h"
 #include "libavutil/opt.h"
@@ -79,6 +77,9 @@ int packet_queue_put(PacketQueue *q, AVPacket *pkt);
 int packet_queue_put_nullpacket(PacketQueue *q, int stream_index);
 int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block);
 media_status_t initFFmpeg();
+int fill_iobuffer(void *opaque, uint8_t *buf, int buf_size);
+
+
 void deInitFFmpeg();
 
 struct ABuffer;
@@ -131,9 +132,9 @@ status_t mInitCheck;
 int mAbortRequest;
 int64_t mDuration;
 int mSeekByBytes;
-
 int initStreams();
 void deInitStreams();
+
 static int decode_interrupt_cb(void *ctx);
 void initFFmpegDefaultOpts();
 int stream_component_open(int stream_index);

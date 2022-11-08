@@ -65,6 +65,13 @@ namespace android {
 
 ////////////////////////////////////////////////////////////////////////////////
 
+typedef struct
+{
+    size_t size; 
+    size_t offset;
+    DataSourceHelper *source;
+}buffer_data;
+
 FFmpegExtractor::FFmpegExtractor(DataSourceHelper *source)
     : mDataSource(source),
       mFirstTrack(NULL),
@@ -150,6 +157,11 @@ int FFmpegExtractor::initStreams()
 
     //initFFmpegDefaultOpts();
 
+    AVIOContext *avio = NULL;
+    buffer_data file_data = {0};
+    unsigned char* iobuffer = NULL;
+
+
     status = initFFmpeg();
     if (status != OK) {
         ret = -1;
@@ -164,13 +176,33 @@ int FFmpegExtractor::initStreams()
         ret = -1;
         return ret;
     }
-    mFormatCtx->interrupt_callback.callback = decode_interrupt_cb;
-    mFormatCtx->interrupt_callback.opaque = this;
-    ALOGV("mFilename: %s", mFilename);
+       
+    //file_data.ptr = (uint8_t *)strtoll(url, NULL, 16);
+    //source->getSize(&getsize);
+    //file_data.size = getsize;
+    //ALOGE(" file ptr %p , size %d ",file_data.ptr,file_data.size);
+    iobuffer = (uint8_t *)av_malloc(65536);
+    if (!iobuffer) {
+        ret = AVERROR(ENOMEM);
+        return ret;
+    }
+
+    avio = avio_alloc_context(iobuffer, 65536, 0, &file_data, fill_iobuffer, NULL, NULL);
+    if (!avio) {
+        ret = AVERROR(ENOMEM);
+        return ret;
+    }
+
+    mFormatCtx->pb = avio;
+    err = avformat_open_input(&mFormatCtx, NULL, NULL, NULL);
+
+    //mFormatCtx->interrupt_callback.callback = decode_interrupt_cb;
+    //mFormatCtx->interrupt_callback.opaque = this;
+    //ALOGV("mFilename: %s", mFilename);
     AVDictionary *format_opts = NULL;
-    err = avformat_open_input(&mFormatCtx, mFilename, NULL, &format_opts);
+    //err = avformat_open_input(&mFormatCtx, mFilename, NULL, &format_opts);
     if (err < 0) {
-        ALOGE("%s: avformat_open_input failed, err:%s", mFilename, av_err2str(err));
+        ALOGD("%s %d:%s avformat_open_input failed, err:%s",__FUNCTION__,__LINE__, mFilename, av_err2str(err));
         ret = -1;
         return ret;
     }
@@ -661,7 +693,31 @@ void deInitFFmpeg()
 //    pthread_mutex_unlock(&s_init_mutex);
 }
 
-static bool SniffFFMPEGCommon(const char *url, float *confidence)
+
+int fill_iobuffer(void *opaque, uint8_t *buf, int read_size)
+{
+     buffer_data *bd = (buffer_data *)opaque;
+     read_size = read_size < (bd->size - bd->offset) ? read_size : (bd->size - bd->offset);
+     if (!read_size) {
+        ALOGE("%s %d return eos AVERROR_EOF",__FUNCTION__, __LINE__,AVERROR_EOF);
+        return AVERROR_EOF;
+     }
+     // binder call time cost ? 
+     if (bd->source->readAt(bd->offset, buf, read_size) < read_size) {
+         ALOGE(" file read size %d",read_size);
+         // need to rethink
+         return AVERROR_BUFFER_TOO_SMALL;
+     }
+    bd->offset += read_size;
+    ALOGE("fill_iobuffer dst %02x %02x %02x %02x %02x %02x %02x %02x    %02x %02x %02x %02x %02x %02x %02x %02x",
+       *(buf),*(buf+1),*(buf+2),*(buf+3),*(buf+4),*(buf+5),*(buf+6),*(buf+7),
+       *(buf+8),*(buf+9),*(buf+10),*(buf+11),*(buf+12),*(buf+13),*(buf+14),*(buf+15));
+
+    return read_size;
+}
+
+
+static bool SniffFFMPEGCommon(DataSourceHelper *source, float *confidence,const char *url) 
 {
     int err = 0;
     bool ret = false;
@@ -671,7 +727,12 @@ static bool SniffFFMPEGCommon(const char *url, float *confidence)
     AVFormatContext *ic = NULL;
     AVDictionary **opts = NULL;
     AVDictionary *codec_opts = NULL;
-
+    buffer_data file_data = {0};
+    AVIOContext *avio = NULL;
+    //todo need to be free
+    unsigned char* iobuffer = NULL;
+    //unsigned char* url_ptr = NULL;
+    off64_t getsize = 0;
     status_t status = initFFmpeg();
     if (status != OK) {
         ALOGE("could not init ffmpeg");
@@ -685,7 +746,26 @@ static bool SniffFFMPEGCommon(const char *url, float *confidence)
         ret = false;
         goto fail;
     }
-    err = avformat_open_input(&ic, url, NULL, NULL);
+    //strtoll(url, url_ptr)
+    //file_data.ptr = (uint8_t *)strtoll(url, NULL, 16);
+    //source->getSize(&getsize);
+    //file_data.size = getsize;
+    //ALOGE(" file ptr %p , size %d ",file_data.ptr,file_data.size);
+    iobuffer = (uint8_t *)av_malloc(65536);
+    if (!iobuffer) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+
+    avio = avio_alloc_context(iobuffer, 65536, 0, &file_data, fill_iobuffer, NULL, NULL);
+    if (!avio) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+
+    ic->pb = avio;
+
+    err = avformat_open_input(&ic, NULL, NULL, NULL);
     //err = avformat_open_input(&ic, "file:/storage/emulated/0/test.mp4", NULL, NULL);
     if (err < 0) {
         ALOGE("%s: avformat_open_input failed, err:%s", url, av_err2str(err));
@@ -729,6 +809,111 @@ fail:
     return ret;
 }
 
+
+static bool SniffFFMPEGLocal(DataSourceHelper *source, float *confidence) 
+{
+    int err = 0;
+    bool ret = false;
+    size_t i = 0;
+    size_t nb_streams = 0;
+    const char *container = NULL;
+    AVFormatContext *ic = NULL;
+    AVDictionary **opts = NULL;
+    AVDictionary *codec_opts = NULL;
+    buffer_data file_data = {0};
+    AVIOContext *avio = NULL;
+    //todo need to be free
+    unsigned char* iobuffer = NULL;
+    unsigned char* srcbuffer = NULL;
+    //unsigned char* url_ptr = NULL;
+    off64_t getsize = 0;
+
+    uint32_t hdr[2];
+    if (source->readAt(0, hdr, 8) < 8) {
+        return false;
+    }
+    ALOGD("[%s %d]source head:0x%x 0x%x",__FUNCTION__,__LINE__, hdr[0],hdr[1]);
+   
+    
+    status_t status = initFFmpeg();
+    if (status != OK) {
+        ALOGE("could not init ffmpeg");
+        return false;
+    }
+
+    ic = avformat_alloc_context();
+    if (!ic)
+    {
+        ALOGE("oom for alloc avformat context");
+        ret = false;
+        goto fail;
+    }
+    
+    //file_data.ptr = (uint8_t *)ptr;
+    source->getSize(&getsize);
+    file_data.size = getsize;
+    file_data.source = source;
+    file_data.offset = 0;
+    
+    ALOGE("file offset %d , size %d file_data.source %p",file_data.offset,file_data.size,file_data.source);
+    iobuffer = (uint8_t *)av_malloc(65536);
+    if (!iobuffer) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+
+    avio = avio_alloc_context(iobuffer, 65536, 0, &file_data, fill_iobuffer, NULL, NULL);
+    if (!avio) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+
+    ic->pb = avio;
+
+    err = avformat_open_input(&ic, NULL, NULL, NULL);
+    //err = avformat_open_input(&ic, "file:/storage/emulated/0/test.mp4", NULL, NULL);
+    if (err < 0) {
+        ALOGE("avformat_open_input failed, err:%s", av_err2str(err));
+        ret = false;
+        goto fail;
+    }
+
+    //opts = setup_find_stream_info_opts(ic, codec_opts);
+    nb_streams = ic->nb_streams;
+    err = avformat_find_stream_info(ic, opts);
+    if (err < 0) {
+        ALOGE("could not find stream info, err:%s", av_err2str(err));
+        ret = false;
+        goto fail;
+    }
+    for (i = 0; i < nb_streams; i++) {
+        av_dict_free(&opts[i]);
+    }
+    av_freep(&opts);
+
+    av_dump_format(ic, 0, 0, 0);
+
+    ALOGD("FFmpegExtrator, format_name: %s, format_long_name: %s",
+             ic->iformat->name, ic->iformat->long_name);
+
+    //container = findMatchingContainer(ic->iformat->name);
+    if (container) {
+        //adjustContainerIfNeeded(&container, ic);
+        //adjustConfidenceIfNeeded(container, ic, confidence);
+    }
+    ret = true;
+
+fail:
+    if (ic) {
+        avformat_close_input(&ic);
+    }
+    if (status == OK) {
+        //deInitFFmpeg();
+    }
+
+    return ret;
+}
+
 static bool LegacySniffFFMPEG(DataSourceHelper *source, float *confidence,const char *url) 
 {
     bool ret = false;
@@ -739,9 +924,8 @@ static bool LegacySniffFFMPEG(DataSourceHelper *source, float *confidence,const 
     if (source->readAt(offset, hdr, 8) < 8) {
         return false;
     }
-    //ALOGE("[%s %d]source head:0x%x 0x%x",__FUNCTION__,__LINE__, hdr[0],hdr[1]);
-
-    ret = SniffFFMPEGCommon(url, confidence);
+    ALOGD("[%s %d]source head:0x%x 0x%x",__FUNCTION__,__LINE__, hdr[0],hdr[1]);
+    ret = SniffFFMPEGCommon(source, confidence, url);
     if (ret) {
         //AMediaFormat_setString(meta, "extended-extractor-url", url);
     }
@@ -755,10 +939,16 @@ static CreatorFunc Sniff(
     DataSourceHelper helper(source);
     ALOGE("[%s %d] [%s %s]yangwen source :%p ",__FUNCTION__,__LINE__,__DATE__,__TIME__, source->handle);
     char url[PATH_MAX] = {0};
-    snprintf(url, sizeof(url), "android:%p", source->handle);
-    //snprintf(url, sizeof(url), "file:%p", source->handle);
+    //snprintf(url, sizeof(url), "android:%p", source->handle);
+    snprintf(url, sizeof(url), "%p", source->handle);
 
-    if (LegacySniffFFMPEG(&helper, confidence, url)) {
+
+    if (SniffFFMPEGLocal(&helper, confidence) || true) {
+        ALOGD("Identified supported ffmpeg through SniffFFMPEGLocal.");
+        *confidence = 0.1;
+        debugFFmpegExtractor(confidence);
+        return CreateExtractor;
+    } else if (LegacySniffFFMPEG(&helper, confidence, url)) {
         ALOGW("Identified supported ffmpeg through LegacySniffFFmpeg.");
         *confidence = 1.0;
         debugFFmpegExtractor(confidence);
@@ -769,6 +959,9 @@ static CreatorFunc Sniff(
 }
 
 static const char *extensions[] = {
+    "ogg",
+    "oga",
+    "opus",
     "3g2",
     "3ga",
     "3gp",
