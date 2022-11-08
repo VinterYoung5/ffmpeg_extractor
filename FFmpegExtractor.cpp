@@ -40,18 +40,17 @@
 #include <media/stagefright/foundation/ColorUtils.h>
 #include <media/stagefright/foundation/MediaDefs.h>
 
-
 #include "FFmpegExtractor.h"
 
 #include "android/log.h"
-#define FF_LOG_TAG               "starFFmpeg"
+#define FF_LOG_TAG                "starFFmpeg"
 #define FF_LOG_VERBOSE            ANDROID_LOG_VERBOSE
 #define FF_LOG_DEBUG              ANDROID_LOG_DEBUG
 #define FF_LOG_INFO               ANDROID_LOG_INFO
 #define FF_LOG_WARN               ANDROID_LOG_WARN
 #define FF_LOG_ERROR              ANDROID_LOG_ERROR
 #define FF_LOG_FATAL              ANDROID_LOG_FATAL
-#define FFLOG(level, TAG, ...)    ((void)__android_log_print(level, TAG, __VA_ARGS__))
+#define FF_LOG2ANDROID(level, TAG, ...)    ((void)__android_log_print(level, TAG, __VA_ARGS__))
 
 #define EXTRACTOR_MAX_PROBE_PACKETS 200
 enum {
@@ -482,9 +481,71 @@ static CMediaExtractor* CreateExtractor(CDataSource *source, void *) {
     return wrap(new FFmpegExtractor(new DataSourceHelper(source)));
 }
 
-static void debugFFmpegExtractor(float *confidence) {
+// FFMPEG LOG LEVEL
+// AV_LOG_QUIET    -8
+// AV_LOG_PANIC     0
+// AV_LOG_FATAL     8
+// AV_LOG_ERROR    16
+// AV_LOG_WARNING  24
+// AV_LOG_INFO     32
+// AV_LOG_VERBOSE  40
+// AV_LOG_DEBUG    48
+// AV_LOG_TRACE    56
+static void ffmpeg_log_to_android_callback(void *ptr, int level, const char *fmt, va_list vl)
+{
+    int loglevel = FF_LOG_VERBOSE;
+    if (level <= AV_LOG_ERROR)
+        loglevel = FF_LOG_ERROR;
+    else if (level <= AV_LOG_WARNING)
+        loglevel = FF_LOG_WARN;
+    else if (level <= AV_LOG_INFO)
+        loglevel = FF_LOG_INFO;
+    else if (level <= AV_LOG_VERBOSE)
+        loglevel = FF_LOG_VERBOSE;
+    else
+        loglevel = FF_LOG_DEBUG;
+
+    va_list vl2;
+    char line[1024];
+    static int print_prefix = 1;
+
+    va_copy(vl2, vl);
+    av_log_format_line(ptr, level, fmt, vl2, line, sizeof(line), &print_prefix);
+    va_end(vl2);
+    FF_LOG2ANDROID(loglevel, FF_LOG_TAG, "%s", line);
+}
+
+static int debugFFmpegLoglevel() {
+    int level = AV_LOG_ERROR;
     char value[PROPERTY_VALUE_MAX];
-    if (property_get("media.stagefright.ffmpeg.extractor", value, NULL)) {
+    if (property_get("media.stagefright.ffmpegextractor.loglevel", value, NULL)) {
+        int level = atoi(value);
+        if (level <= AV_LOG_QUIET)
+            level = AV_LOG_QUIET;
+        else if (level <= AV_LOG_PANIC)
+            level = AV_LOG_PANIC;
+        else if (level <= AV_LOG_FATAL)
+            level = AV_LOG_FATAL;
+        else if (level <= AV_LOG_ERROR)
+            level = AV_LOG_ERROR;
+        else if (level <= AV_LOG_WARNING)
+            level = AV_LOG_WARNING;
+        else if (level <= AV_LOG_INFO)
+            level = AV_LOG_INFO;
+        else if (level <= AV_LOG_VERBOSE)
+            level = AV_LOG_VERBOSE;
+        else if (level <= AV_LOG_DEBUG)
+            level = AV_LOG_DEBUG;
+        else
+            level = AV_LOG_TRACE;
+        ALOGD("[debug] get ffmpeg log level %d", level); 
+    }
+    return level;
+}
+
+static void debugFFmpegExtractorConfidence(float *confidence) {
+    char value[PROPERTY_VALUE_MAX];
+    if (property_get("media.stagefright.ffmpegextractor.confidence", value, NULL)) {
         if (atof(value)) {
             float conf = (atof(value) > 1.0f) ? 1.0f : ((atof(value) <= 0) ? 0.0f : atof(value));
             *confidence = conf;
@@ -625,33 +686,12 @@ int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block)
     return ret;
 }
 
-static void ffmpeg_log_to_android_callback(void *ptr, int level, const char *fmt, va_list vl)
-{
-    int loglevel = FF_LOG_VERBOSE;
-    if (level <= AV_LOG_ERROR)
-        loglevel = FF_LOG_ERROR;
-    else if (level <= AV_LOG_WARNING)
-        loglevel = FF_LOG_WARN;
-    else if (level <= AV_LOG_INFO)
-        loglevel = FF_LOG_INFO;
-    else if (level <= AV_LOG_VERBOSE)
-        loglevel = FF_LOG_VERBOSE;
-    else
-        loglevel = FF_LOG_DEBUG;
-
-    va_list vl2;
-    char line[1024];
-    static int print_prefix = 1;
-
-    va_copy(vl2, vl);
-    av_log_format_line(ptr, level, fmt, vl2, line, sizeof(line), &print_prefix);
-    va_end(vl2);
-    FFLOG(loglevel, FF_LOG_TAG, "%s", line);
-}
 media_status_t initFFmpeg() 
 {
     media_status_t ret = AMEDIA_OK;
-    av_log_set_level(AV_LOG_ERROR);
+    int fflog = debugFFmpegLoglevel();
+    //todo: not effect
+    av_log_set_level(fflog);
     av_log_set_callback(ffmpeg_log_to_android_callback);
 /*
     pthread_mutex_lock(&s_init_mutex);
@@ -822,19 +862,12 @@ static bool SniffFFMPEGLocal(DataSourceHelper *source, float *confidence)
     AVDictionary *codec_opts = NULL;
     buffer_data file_data = {0};
     AVIOContext *avio = NULL;
-    //todo need to be free
+    //todo need to be free?
     unsigned char* iobuffer = NULL;
     unsigned char* srcbuffer = NULL;
     //unsigned char* url_ptr = NULL;
     off64_t getsize = 0;
 
-    uint32_t hdr[2];
-    if (source->readAt(0, hdr, 8) < 8) {
-        return false;
-    }
-    ALOGD("[%s %d]source head:0x%x 0x%x",__FUNCTION__,__LINE__, hdr[0],hdr[1]);
-   
-    
     status_t status = initFFmpeg();
     if (status != OK) {
         ALOGE("could not init ffmpeg");
@@ -946,12 +979,12 @@ static CreatorFunc Sniff(
     if (SniffFFMPEGLocal(&helper, confidence) || true) {
         ALOGD("Identified supported ffmpeg through SniffFFMPEGLocal.");
         *confidence = 0.1;
-        debugFFmpegExtractor(confidence);
+        debugFFmpegExtractorConfidence(confidence);
         return CreateExtractor;
     } else if (LegacySniffFFMPEG(&helper, confidence, url)) {
         ALOGW("Identified supported ffmpeg through LegacySniffFFmpeg.");
         *confidence = 1.0;
-        debugFFmpegExtractor(confidence);
+        debugFFmpegExtractorConfidence(confidence);
         return CreateExtractor;
     }
 
