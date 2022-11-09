@@ -486,8 +486,8 @@ static void debugFFmpegExtractorConfidence(float *confidence) {
     if (property_get("media.stagefright.ffmpegextractor.confidence", value, NULL)) {
         if (atof(value)) {
             float conf = (atof(value) > 1.0f) ? 1.0f : ((atof(value) <= 0) ? 0.0f : atof(value));
+            ALOGD("[debug] set ffmpeg parser confidence from %.2f to %.2f", *confidence,conf);
             *confidence = conf;
-            ALOGD("[debug] set ffmpeg parser confidence %d", *confidence);
         }
     }
 }
@@ -506,7 +506,7 @@ static void debugFFmpegExtractorConfidence(float *confidence) {
 static int debugFFmpegLoglevel() {
     int level = AV_LOG_ERROR;
     char value[PROPERTY_VALUE_MAX];
-    if (property_get("media.stagefright.ffmpegextractor.loglevel", value, NULL)) {
+    if (property_get("media.stagefright.ffmpeg.loglevel", value, NULL)) {
         level = atoi(value);
         if (level <= AV_LOG_QUIET)
             level = AV_LOG_QUIET;
@@ -551,7 +551,6 @@ static void ffmpeg_log_to_android_callback(void *ptr, int cur_level, const char 
         loglevel = FF_LOG_VERBOSE;
     else
         loglevel = FF_LOG_DEBUG;
-    ALOGD("[debug] callback ffmpeg log fflevel %d, androidlevel %d",cur_level, loglevel);
 
     va_list vl2;
     char line[1024];
@@ -698,9 +697,9 @@ int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block)
 media_status_t initFFmpeg() 
 {
     media_status_t ret = AMEDIA_OK;
-    int fflog = debugFFmpegLoglevel();
-    //todo: not effect
-    av_log_set_level(fflog);
+    g_ffmpeg_loglevel = debugFFmpegLoglevel();
+    ALOGE("g_ffmpeg_loglevel %d",g_ffmpeg_loglevel);
+    //av_log_set_level(fflog);
     av_log_set_callback(ffmpeg_log_to_android_callback);
 /*
     pthread_mutex_lock(&s_init_mutex);
@@ -758,7 +757,7 @@ int fill_iobuffer(void *opaque, uint8_t *buf, int read_size)
          return AVERROR_BUFFER_TOO_SMALL;
      }
     bd->offset += read_size;
-    ALOGE("fill_iobuffer dst %02x %02x %02x %02x %02x %02x %02x %02x    %02x %02x %02x %02x %02x %02x %02x %02x",
+    ALOGI("fill_iobuffer dst %02x %02x %02x %02x %02x %02x %02x %02x    %02x %02x %02x %02x %02x %02x %02x %02x",
        *(buf),*(buf+1),*(buf+2),*(buf+3),*(buf+4),*(buf+5),*(buf+6),*(buf+7),
        *(buf+8),*(buf+9),*(buf+10),*(buf+11),*(buf+12),*(buf+13),*(buf+14),*(buf+15));
 
@@ -815,7 +814,6 @@ static bool SniffFFMPEGCommon(DataSourceHelper *source, float *confidence,const 
     ic->pb = avio;
 
     err = avformat_open_input(&ic, NULL, NULL, NULL);
-    //err = avformat_open_input(&ic, "file:/storage/emulated/0/test.mp4", NULL, NULL);
     if (err < 0) {
         ALOGE("%s: avformat_open_input failed, err:%s", url, av_err2str(err));
         ret = false;
@@ -922,7 +920,7 @@ static bool SniffFFMPEGLocal(DataSourceHelper *source, float *confidence)
     //opts = setup_find_stream_info_opts(ic, codec_opts);
     nb_streams = ic->nb_streams;
     //add by Vinter, limit timecost when find stream info
-    ic->probesize = 1024 * 1024;
+    ic->probesize = 64 * 1024;
     ic->max_analyze_duration = AV_TIME_BASE;
     err = avformat_find_stream_info(ic, opts);
     if (err < 0) {
@@ -939,7 +937,7 @@ static bool SniffFFMPEGLocal(DataSourceHelper *source, float *confidence)
 
     ALOGD("FFmpegExtrator, format_name: %s, format_long_name: %s",
              ic->iformat->name, ic->iformat->long_name);
-
+    //todo
     //container = findMatchingContainer(ic->iformat->name);
     if (container) {
         //adjustContainerIfNeeded(&container, ic);
@@ -989,12 +987,12 @@ static CreatorFunc Sniff(
 
     if (SniffFFMPEGLocal(&helper, confidence) || true) {
         ALOGD("Identified supported ffmpeg through SniffFFMPEGLocal.");
-        *confidence = 0.1;
+        *confidence = 0.90;
         debugFFmpegExtractorConfidence(confidence);
         return CreateExtractor;
     } else if (LegacySniffFFMPEG(&helper, confidence, url)) {
         ALOGW("Identified supported ffmpeg through LegacySniffFFmpeg.");
-        *confidence = 1.0;
+        *confidence = 0.10;
         debugFFmpegExtractorConfidence(confidence);
         return CreateExtractor;
     }
