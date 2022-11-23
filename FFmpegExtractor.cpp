@@ -449,7 +449,7 @@ int FFmpegExtractor::initStreams()
     //initFFmpegDefaultOpts();
 
     AVIOContext *avio = NULL;
-    buffer_data file_data = {0};
+    //buffer_data file_data = {0};
     unsigned char* iobuffer = NULL;
     off64_t getsize = 0;
 
@@ -469,11 +469,11 @@ int FFmpegExtractor::initStreams()
     }
 
     mDataSource->getSize(&getsize);
-    file_data.size = getsize;
-    file_data.source = mDataSource;
-    file_data.offset = 0;
+    mIoData.size = getsize;
+    mIoData.source = mDataSource;
+    mIoData.offset = 0;
 
-    ALOGD("%s %d.file offset %d , size %d file_data.source %p",__FUNCTION__,__LINE__,file_data.offset,file_data.size,file_data.source);
+    ALOGD("%s %d.file offset %d , size %d file_data.source %p",__FUNCTION__,__LINE__,mIoData.offset,mIoData.size,mIoData.source);
 
     iobuffer = (uint8_t *)av_malloc(SIZE_64KB);
     if (!iobuffer) {
@@ -481,7 +481,7 @@ int FFmpegExtractor::initStreams()
         return ret;
     }
 
-    avio = avio_alloc_context(iobuffer, SIZE_64KB, 0, &file_data, fill_iobuffer, NULL, seek_iobuffer);
+    avio = avio_alloc_context(iobuffer, SIZE_64KB, 0, &mIoData, fill_iobuffer, NULL, seek_iobuffer);
     if (!avio) {
         ret = AVERROR(ENOMEM);
         return ret;
