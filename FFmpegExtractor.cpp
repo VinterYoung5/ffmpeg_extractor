@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-//#define LOG_NDEBUG 0
+#define LOG_NDEBUG 0
 #define LOG_TAG "FFmpegExtractor"
 #include <utils/Log.h>
 
@@ -40,6 +40,7 @@
 #include <media/stagefright/foundation/ColorUtils.h>
 #include <media/stagefright/foundation/MediaDefs.h>
 
+
 #include "FFmpegExtractor.h"
 
 #include "android/log.h"
@@ -52,37 +53,251 @@
 #define FF_LOG_FATAL              ANDROID_LOG_FATAL
 #define FF_LOG2ANDROID(level, TAG, ...)    ((void)__android_log_print(level, TAG, __VA_ARGS__))
 
+#define SIZE_64KB 64 * 1024
 #define EXTRACTOR_MAX_PROBE_PACKETS 200
+
+static pthread_mutex_t s_init_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int s_ref_count = 0;
 enum {
     NO_SEEK = 0,
     SEEK,
 };
-static pthread_mutex_t s_init_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int s_ref_count = 0;
-
+#define min(a,b) ((a) < (b) ? (a) : (b))
 namespace android {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-typedef struct
-{
-    size_t size; 
-    size_t offset;
-    DataSourceHelper *source;
-}buffer_data;
+class FFmpegSource : public MediaTrackHelper {
+public:
+    explicit FFmpegSource(AMediaFormat *format, DataSourceHelper *dataSource, uint32_t trackId, int32_t timeScale, buffer_data *mData,AVFormatContext *fc);
+    virtual status_t init();
+
+    virtual media_status_t start();
+    virtual media_status_t stop();
+
+    virtual media_status_t getFormat(AMediaFormat *);
+
+    virtual media_status_t read(MediaBufferHelper **buffer, const ReadOptions *options = NULL);
+//    bool supportsNonBlockingRead() override { return true; }
+//    virtual media_status_t fragmentedRead(      MediaBufferHelper **buffer, const ReadOptions *options = NULL);
+
+    virtual ~FFmpegSource();
+
+private:
+    uint32_t mTrackId;
+    Mutex mLock;
+    AVFormatContext *sourceFormatContext;
+    AMediaFormat *mFormat;
+    DataSourceHelper *mDataSource;
+    buffer_data *mSourceIoData;
+    int32_t mTimescale;
+    bool mStarted;
+    bool mIsHeif;
+    bool mIsAvif;
+    int mSeekFlags;
+    MediaBufferHelper *mBuffer;
+    bool mEOF;
+
+    FFmpegSource(const FFmpegSource &);
+    FFmpegSource &operator=(const FFmpegSource &);
+};
+
+////////////////////////////////////////////////////////////////////////////////
+
+FFmpegSource::FFmpegSource(
+        AMediaFormat *format,
+         DataSourceHelper *dataSource,
+        uint32_t trackId, 
+        int32_t timeScale,
+        buffer_data  *mData,
+        AVFormatContext *fc)
+    : mFormat(format),
+      mDataSource(dataSource),
+      mStarted(false),
+      mIsHeif(false),
+      mTrackId(trackId),
+      mIsAvif(false),
+      mEOF(false),
+      sourceFormatContext(fc),
+      mTimescale(timeScale)
+    {
+    ALOGE("%s %d",__FUNCTION__,__LINE__);
+    const char *mime;
+    mSourceIoData = NULL;
+    if (!mData) {
+        mSourceIoData->source = mData->source;
+        ALOGE("%s %d,source %p",__FUNCTION__,__LINE__,mSourceIoData->source);
+    }
+    bool success = AMediaFormat_getString(mFormat, AMEDIAFORMAT_KEY_MIME, &mime);
+    ALOGE("%s %d, trackid %d ,mime %s,this %p,formatctx %p",__FUNCTION__,__LINE__,trackId,mime,this,fc);
+    
+}
+
+FFmpegSource::~FFmpegSource() {
+    ALOGE("%s %d",__FUNCTION__,__LINE__);
+
+}
+status_t FFmpegSource::init() {
+    ALOGE("%s %d",__FUNCTION__,__LINE__);
+    return OK;
+}
+
+media_status_t FFmpegSource::start() {
+    ALOGE("%s %d",__FUNCTION__,__LINE__);
+    Mutex::Autolock autoLock(mLock);
+
+
+    int32_t tmp;
+    if (!AMediaFormat_getInt32(mFormat, AMEDIAFORMAT_KEY_MAX_INPUT_SIZE, &tmp)){
+        tmp = 4 * 1024 * 1024;
+        ALOGE("%s %d],not get maxinputsize set default %d",__FUNCTION__,__LINE__,tmp);
+         
+    }
+    size_t max_size = tmp;
+
+    // A somewhat arbitrary limit that should be sufficient for 8k video frames
+    // If you see the message below for a valid input stream: increase the limit
+    const size_t kMaxBufferSize = 64 * 1024 * 1024;
+    if (max_size > kMaxBufferSize) {
+        ALOGE("bogus max input size: %zu > %zu", max_size, kMaxBufferSize);
+        return AMEDIA_ERROR_MALFORMED;
+    }
+    if (max_size == 0) {
+        ALOGE("zero max input size");
+        return AMEDIA_ERROR_MALFORMED;
+    }
+
+    // Allow up to kMaxBuffers, but not if the total exceeds kMaxBufferSize.
+    const size_t kInitialBuffers = 2;
+    const size_t kMaxBuffers = 8;
+    const size_t realMaxBuffers = min(kMaxBufferSize / max_size, kMaxBuffers);
+    mBufferGroup->init(kInitialBuffers, max_size, realMaxBuffers);
+
+
+    
+    mStarted = true;
+
+    return AMEDIA_OK;
+}
+
+media_status_t FFmpegSource::stop() {
+    ALOGE("%s %d",__FUNCTION__,__LINE__);
+
+    return AMEDIA_OK;
+}
+
+media_status_t FFmpegSource::getFormat(AMediaFormat *meta) {
+    ALOGE("%s %d",__FUNCTION__,__LINE__);
+
+    Mutex::Autolock autoLock(mLock);
+    AMediaFormat_copy(meta, mFormat);
+    return AMEDIA_OK;
+}
+
+media_status_t FFmpegSource::read(
+        MediaBufferHelper **out, const ReadOptions *options) {
+    ALOGE("%s %d,",__FUNCTION__,__LINE__);
+
+    Mutex::Autolock autoLock(mLock);
+    AVPacket pkt1, *pkt = &pkt1;
+    int ret = 0;
+    int eof = 0;
+    int read  = 0;
+    status_t err;
+    AVCodecContext *avctx = NULL;
+    CHECK(mStarted);
+    if (options != nullptr && options->getNonBlocking() && !mBufferGroup->has_buffers()) {
+        ALOGE("%s %d",__FUNCTION__,__LINE__);
+        *out = nullptr;
+        return AMEDIA_ERROR_WOULD_BLOCK;
+    }
+    *out = NULL;
+    int64_t targetSampleTimeUs = -1;
+
+    int64_t seekTimeUs;
+    ReadOptions::SeekMode mode;
+    
+
+    if (options && options->getSeekTo(&seekTimeUs, &mode)) {
+        ALOGD("seekTimeUs:%" PRId64, seekTimeUs);
+
+        mSeekFlags = AVSEEK_FLAG_BACKWARD;
+        ret = avformat_seek_file(sourceFormatContext, -1, INT64_MIN, seekTimeUs, INT64_MAX, mSeekFlags);
+        if (ret < 0) {
+            ALOGE("%s: avformat_seek_file error");
+        }
+
+        if (mBuffer != NULL) {
+            mBuffer->release();
+            mBuffer = NULL;
+        }
+
+        // fall through
+    }
+
+    bool newBuffer = false;
+    if (mBuffer == NULL) {    
+        newBuffer = true;
+        ALOGD(" codec type %d",sourceFormatContext->streams[mTrackId]->codecpar->codec_type);
+        if (sourceFormatContext->streams[mTrackId]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            ALOGD("[%s %d] video w %d, h %d",__FUNCTION__,__LINE__,sourceFormatContext->streams[mTrackId]->codec->width,sourceFormatContext->streams[mTrackId]->codec->height);
+        } else{ 
+            ALOGD("[%s %d] audio w %d, h %d",__FUNCTION__,__LINE__,sourceFormatContext->streams[mTrackId]->codec->width,sourceFormatContext->streams[mTrackId]->codec->height);
+        }
+        ret = av_read_frame(sourceFormatContext, pkt);
+        if (ret == AVERROR_EOF) {
+            eof = 1;
+            mEOF = true;
+            ALOGD("ret == AVERROR_EOF");
+            return AMEDIA_ERROR_END_OF_STREAM  ;
+        } else if (ret == EAGAIN) {
+            return AMEDIA_OK;
+
+        } else if (ret < 0) {
+            ALOGD("ret 0x%x return AMEDIA_ERROR_UNKNOWN %d %d",ret,sourceFormatContext->streams[mTrackId]->codec->width,sourceFormatContext->streams[mTrackId]->codec->height);
+            return AMEDIA_ERROR_UNKNOWN;
+        }
+        ALOGD("read success");
+        if (pkt->stream_index == mTrackId) {
+
+        
+        }
+
+        err = mBufferGroup->acquire_buffer(&mBuffer);
+        if (err != OK) {
+            CHECK(mBuffer == NULL);
+            return AMEDIA_ERROR_UNKNOWN;
+        }
+        if (pkt->size > mBuffer->size()) {
+            //ALOGE("buffer too small: pkt %zu > buffer %zu", pkt->size, mBuffer->size());
+            mBuffer->release();
+            mBuffer = NULL;
+            return AMEDIA_ERROR_UNKNOWN; // ERROR_BUFFER_TOO_SMALL
+        }
+
+    }
+    return AMEDIA_OK;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+///////////////////////////////////////////////////////
+
 
 FFmpegExtractor::FFmpegExtractor(DataSourceHelper *source)
     : mDataSource(source),
       mFirstTrack(NULL),
       mLastTrack(NULL) 
 {
+    ALOGD("FFmpegExtractor::FFmpegExtractor");
     mFileMetaData = AMediaFormat_new();
-    ALOGV("yangwen constuct ffmpeg extractor");
     int ret = initStreams();
     if (ret < 0) {
-        ALOGE("failed to init ffmpeg");
+        ALOGE("failed to init FFmpegExtractor");
         return;
     }
+    mShowStatus = 1;
+    mIoData.source = NULL;
 
     // start reader here, as we want to extract extradata from bitstream if no extradata
     //startReaderThread();
@@ -102,29 +317,106 @@ FFmpegExtractor::FFmpegExtractor(DataSourceHelper *source)
 
 FFmpegExtractor::~FFmpegExtractor() {
     ALOGV("FFmpegExtractor::~FFmpegExtractor");
+    Track *track = mFirstTrack;
+    while (track) {
+        Track *next = track->next;
+
+        delete track;
+        track = next;
+    }
+    mFirstTrack = mLastTrack = NULL;
+    delete mDataSource;
+    AMediaFormat_delete(mFileMetaData);
 }
 
 size_t FFmpegExtractor::countTracks() {
-    return 0;
+    status_t err;
+    if ((err = readMetaData()) != AMEDIA_OK) {
+        ALOGV("FFmpegExtractor::countTracks: no tracks");
+        return 0;
+    }
+
+    size_t n = 0;
+    Track *track = mFirstTrack;
+    while (track) {
+        ++n;
+        track = track->next;
+    }
+    ALOGD("FFmpegExtractor::countTracks[%d]", n);
+
+    return n;
 }
 
 MediaTrackHelper* FFmpegExtractor::getTrack(size_t index) {
-    ALOGV("FFmpegExtractor::getTrack[%d]", index);
+    ALOGD("FFmpegExtractor::getTrack[%d]", index);
+    status_t err;
+    if ((err = readMetaData()) != OK) {
+        return NULL;
+    }
+
     Track *track = mFirstTrack;
-    return new FFmpegSource(track->meta, this, track->trackId, track->timescale);
+    while (index > 0) {
+        if (track == NULL) {
+            return NULL;
+        }
+
+        track = track->next;
+        --index;
+    }
+
+    if (track == NULL) {
+        return NULL;
+    }
+    const char *mime;
+    if (!AMediaFormat_getString(track->meta, AMEDIAFORMAT_KEY_MIME, &mime)) {
+        return NULL;
+    }
+
+    FFmpegSource* source = new FFmpegSource(track->meta, mDataSource, track->trackId, track->timescale, &mIoData, mFormatCtx);
+    return source;
 }
 
 media_status_t FFmpegExtractor::getTrackMetaData(AMediaFormat *meta, size_t index, uint32_t flags) 
 {
-    return AMEDIA_OK;
+    
+    ALOGD("%s %d,index %d,flags %d",__FUNCTION__,__LINE__,index,flags);
+    
+    Track *track = mFirstTrack;
+    while (index > 0) {
+        if (track == NULL) {
+            return AMEDIA_ERROR_UNKNOWN;
+        }
+
+        track = track->next;
+        --index;
+    }
+
+    if (track == NULL) {
+        return AMEDIA_ERROR_UNKNOWN;
+    }
+
+    return AMediaFormat_copy(meta, track->meta);
 }
 
 media_status_t FFmpegExtractor::getMetaData(AMediaFormat *meta) {
+    ALOGD("%s %d",__FUNCTION__,__LINE__);
+    status_t err;
+    if ((err = readMetaData()) != OK) {
+        return AMEDIA_ERROR_UNKNOWN;
+    }
+    AMediaFormat_copy(meta, mFileMetaData);
 
+    return AMEDIA_OK;
+}
+
+status_t FFmpegExtractor::readMetaData() {
+    ALOGD("%s %d",__FUNCTION__,__LINE__);
     return AMEDIA_OK;
 }
 
 uint32_t FFmpegExtractor::flags() const {
+    ALOGD("%s %d",__FUNCTION__,__LINE__);
+
     return 0;
 }
 
@@ -143,7 +435,7 @@ int FFmpegExtractor::initStreams()
     int eof = 0;
     int ret = 0, audio_ret = -1, video_ret = -1;
     int pkt_in_play_range = 0;
-    AVDictionaryEntry *t = NULL;
+    AVDictionaryEntry *avdict_entry = NULL;
     AVDictionary **opts = NULL;
     int orig_nb_streams = 0;
     int st_index[AVMEDIA_TYPE_NB] = {0};
@@ -153,13 +445,13 @@ int FFmpegExtractor::initStreams()
     wanted_stream[AVMEDIA_TYPE_AUDIO]  = -1;
     wanted_stream[AVMEDIA_TYPE_VIDEO]  = -1;
     const char *mime = NULL;
-
+    
     //initFFmpegDefaultOpts();
 
     AVIOContext *avio = NULL;
     buffer_data file_data = {0};
     unsigned char* iobuffer = NULL;
-
+    off64_t getsize = 0;
 
     status = initFFmpeg();
     if (status != OK) {
@@ -175,18 +467,21 @@ int FFmpegExtractor::initStreams()
         ret = -1;
         return ret;
     }
-       
-    //file_data.ptr = (uint8_t *)strtoll(url, NULL, 16);
-    //source->getSize(&getsize);
-    //file_data.size = getsize;
-    //ALOGE(" file ptr %p , size %d ",file_data.ptr,file_data.size);
-    iobuffer = (uint8_t *)av_malloc(65536);
+
+    mDataSource->getSize(&getsize);
+    file_data.size = getsize;
+    file_data.source = mDataSource;
+    file_data.offset = 0;
+
+    ALOGD("%s %d.file offset %d , size %d file_data.source %p",__FUNCTION__,__LINE__,file_data.offset,file_data.size,file_data.source);
+
+    iobuffer = (uint8_t *)av_malloc(SIZE_64KB);
     if (!iobuffer) {
         ret = AVERROR(ENOMEM);
         return ret;
     }
 
-    avio = avio_alloc_context(iobuffer, 65536, 0, &file_data, fill_iobuffer, NULL, NULL);
+    avio = avio_alloc_context(iobuffer, SIZE_64KB, 0, &file_data, fill_iobuffer, NULL, seek_iobuffer);
     if (!avio) {
         ret = AVERROR(ENOMEM);
         return ret;
@@ -206,8 +501,8 @@ int FFmpegExtractor::initStreams()
         return ret;
     }
 
-    if ((t = av_dict_get(format_opts, "", NULL, AV_DICT_IGNORE_SUFFIX))) {
-        ALOGE("Option %s not found.\n", t->key);
+    if ((avdict_entry = av_dict_get(format_opts, "", NULL, AV_DICT_IGNORE_SUFFIX))) {
+        ALOGE("Option %s not found.\n", avdict_entry->key);
         //ret = AVERROR_OPTION_NOT_FOUND;
         ret = -1;
         return ret;
@@ -226,9 +521,9 @@ int FFmpegExtractor::initStreams()
         ret = -1;
         return ret;
     }
-    for (i = 0; i < orig_nb_streams; i++)
-        av_dict_free(&opts[i]);
-    av_freep(&opts);
+//    for (i = 0; i < orig_nb_streams; i++)
+//        av_dict_free(&opts[i]);
+//    av_freep(&opts);
 
     if (mFormatCtx->pb)
         mFormatCtx->pb->eof_reached = 0; // FIXME hack, ffplay maybe should not use url_feof() to test for the end
@@ -249,15 +544,17 @@ int FFmpegExtractor::initStreams()
                                 wanted_stream[AVMEDIA_TYPE_AUDIO],
                                 st_index[AVMEDIA_TYPE_VIDEO],
                                 NULL, 0);
-//    if (mShowStatus) {
-//        av_dump_format(mFormatCtx, 0, mFilename, 0);
-//    }
+    
+    ALOGD("st_index V %d A %d",st_index[AVMEDIA_TYPE_VIDEO],st_index[AVMEDIA_TYPE_AUDIO]);
+    if (mShowStatus) {
+        av_dump_format(mFormatCtx, 0, mFilename, 0);
+    }
 
     if (mFormatCtx->duration != AV_NOPTS_VALUE &&
             mFormatCtx->start_time != AV_NOPTS_VALUE) {
         int hours, mins, secs, us;
 
-        ALOGV("file startTime: %lld", mFormatCtx->start_time);
+        ALOGD("file startTime: %lld", mFormatCtx->start_time);
 
         mDuration = mFormatCtx->duration;
 
@@ -267,7 +564,7 @@ int FFmpegExtractor::initStreams()
         secs %= 60;
         hours = mins / 60;
         mins %= 60;
-        ALOGI("the duration is %02d:%02d:%02d.%02d",
+        ALOGD("the duration is %02d:%02d:%02d.%02d",
             hours, mins, secs, (100 * us) / AV_TIME_BASE);
     }
 
@@ -280,6 +577,12 @@ int FFmpegExtractor::initStreams()
 
     if (st_index[AVMEDIA_TYPE_VIDEO] >= 0) {
         video_ret = stream_component_open(st_index[AVMEDIA_TYPE_VIDEO]);
+    }
+
+    AMediaFormat_setString(mFileMetaData,
+            AMEDIAFORMAT_KEY_MIME, MEDIA_MIMETYPE_CONTAINER_MPEG4);
+    if (mDuration != 0) {
+        AMediaFormat_setInt64(mFileMetaData, AMEDIAFORMAT_KEY_DURATION, mDuration);
     }
 
     if ( audio_ret < 0 && video_ret < 0) {
@@ -306,176 +609,166 @@ void FFmpegExtractor::deInitStreams()
     }
 }
 
-int FFmpegExtractor::stream_component_open(int stream_index)
+int FFmpegExtractor::stream_component_open(int stream_id)
 {
-    /*
-    Track *trackInfo = NULL;
-    AVCodecParameters *avctx = NULL;
-    AMediaFormat * meta = NULL;
+
+    AVCodecParameters *codec_param = NULL;
+    //AMediaFormat * meta = NULL;
     bool supported = false;
     uint32_t type = 0;
     const void *data = NULL;
     size_t size = 0;
     int ret = 0;
 
-    ALOGI("stream_index: %d", stream_index);
-    if (stream_index < 0 || stream_index >= (int)mFormatCtx->nb_streams)
-        return -1;
-    avctx = mFormatCtx->streams[stream_index]->codecpar;
+    ALOGD("[%s %d]stream_id: %d",__FUNCTION__,__LINE__, stream_id);
 
-    supported = is_codec_supported(avctx->codec_id);
-
-    if (!supported) {
-        ALOGE("unsupport the codec(%s)", avcodec_get_name(avctx->codec_id));
+    if (stream_id < 0 || stream_id >= (int)mFormatCtx->nb_streams)
         return -1;
-    }
-    ALOGI("support the codec(%s)", avcodec_get_name(avctx->codec_id));
+    codec_param = mFormatCtx->streams[stream_id]->codecpar;
+
+//    supported = is_codec_supported(codec_param->codec_id);
+//
+//    if (!supported) {
+//        ALOGE("unsupport the codec(%s)", avcodec_get_name(codec_param->codec_id));
+//        return -1;
+//    }
+//    ALOGI("support the codec(%s)", avcodec_get_name(codec_param->codec_id));
 
     unsigned streamType;
-    for (size_t i = 0; i < mTracks.size(); ++i) {
-        if (stream_index == mTracks.editItemAt(i).trackId) {
-            ALOGE("this track already exists");
-            return 0;
-        }
-    }
+//    for (size_t i = 0; i < mTracks.size(); ++i) {
+//        if (stream_id == mTracks.editItemAt(i).trackId) {
+//            ALOGE("this track already exists");
+//            return 0;
+//        }
+//    }
 
-    mFormatCtx->streams[stream_index]->discard = AVDISCARD_DEFAULT;
+    mFormatCtx->streams[stream_id]->discard = AVDISCARD_DEFAULT;
 
 //    char tagbuf[32];
-//    av_get_codec_tag_string(tagbuf, sizeof(tagbuf), avctx->codec_tag);
-//    ALOGV("Tag %s/0x%08x with codec(%s)\n", tagbuf, avctx->codec_tag, avcodec_get_name(avctx->codec_id));
+//    av_get_codec_tag_string(tagbuf, sizeof(tagbuf), codec_param->codec_tag);
+//    ALOGV("Tag %s/0x%08x with codec(%s)\n", tagbuf, codec_param->codec_tag, avcodec_get_name(codec_param->codec_id));
 
-    switch (avctx->codec_type) {
-    case AVMEDIA_TYPE_VIDEO:
-        if (mVideoStreamIdx == -1)
-            mVideoStreamIdx = stream_index;
-        if (mVideoStream == NULL)
-            mVideoStream = mFormatCtx->streams[stream_index];
+    switch (codec_param->codec_type) {
+        case AVMEDIA_TYPE_VIDEO: {
+            if (mVideoStreamIdx == -1)
+                mVideoStreamIdx = stream_id;
+            if (mVideoStream == NULL)
+                mVideoStream = mFormatCtx->streams[stream_id];
 
-        ret = check_extradata(avctx);
-        if (ret != 1) {
-            if (ret == -1) {
-                // disable the stream
-                mVideoStreamIdx = -1;
-                mVideoStream = NULL;
-                packet_queue_end(&mVideoQ);
-                mFormatCtx->streams[stream_index]->discard = AVDISCARD_ALL;
+    //        ret = check_extradata(codec_param);
+    //        if (ret != 1) {
+    //            if (ret == -1) {
+    //                // disable the stream
+    //                mVideoStreamIdx = -1;
+    //                mVideoStream = NULL;
+    //                packet_queue_end(&mVideoQ);
+    //                mFormatCtx->streams[stream_id]->discard = AVDISCARD_ALL;
+    //            }
+    //            return ret;
+    //        }
+
+            if (codec_param->extradata) {
+                ALOGV("video stream extradata:");
+                //hexdump(codec_param->extradata, codec_param->extradata_size);
+            } else {
+                ALOGV("video stream no extradata, but we can ignore it.");
             }
-            return ret;
-         }
+            //
+    //        meta = setVideoFormat(mVideoStream);
+    //        if (meta == NULL) {
+    //            ALOGE("setVideoFormat failed");
+    //            return -1;
+    //        }
 
-        if (avctx->extradata) {
-            ALOGV("video stream extradata:");
-            //hexdump(avctx->extradata, avctx->extradata_size);
-        } else {
-            ALOGV("video stream no extradata, but we can ignore it.");
-        }
+            ALOGV("create a video track");
+            //mTracks.push();
+            //trackInfo = &mTracks.editItemAt(mTracks.size() - 1);
+    //        trackInfo->trackId  = stream_id;
+    //        trackInfo->meta   = meta;
+    //        trackInfo->mStream = mVideoStream;
+    //        trackInfo->mQueue  = &mVideoQ;
 
-//        meta = setVideoFormat(mVideoStream);
-//        if (meta == NULL) {
-//            ALOGE("setVideoFormat failed");
-//            return -1;
-//        }
-
-        ALOGV("create a video track");
-        mTracks.push();
-        trackInfo = &mTracks.editItemAt(mTracks.size() - 1);
-        trackInfo->trackId  = stream_index;
-        trackInfo->meta   = meta;
-        trackInfo->mStream = mVideoStream;
-        trackInfo->mQueue  = &mVideoQ;
-
-        mDefersToCreateVideoTrack = false;
-
-        break;
-    case AVMEDIA_TYPE_AUDIO:
-        if (mAudioStreamIdx == -1)
-            mAudioStreamIdx = stream_index;
-        if (mAudioStream == NULL)
-            mAudioStream = mFormatCtx->streams[stream_index];
-
-        ret = check_extradata(avctx);
-        if (ret != 1) {
-            if (ret == -1) {
-                // disable the stream
-                mAudioStreamIdx = -1;
-                mAudioStream = NULL;
-                packet_queue_end(&mAudioQ);
-                mFormatCtx->streams[stream_index]->discard = AVDISCARD_ALL;
+            Track *track = new Track;
+            if (mLastTrack != NULL) {
+                mLastTrack->next = track;
+            } else {
+                mFirstTrack = track;
             }
-            return ret;
+            mLastTrack = track;
+            
+            track->meta = AMediaFormat_new();
+            track->timescale = 1000000;
+            track->trackId = stream_id;
+            track->mStream = mVideoStream;
+            AMediaFormat_setInt32(track->meta, AMEDIAFORMAT_KEY_TRACK_ID, stream_id); 
+            AMediaFormat_setString(track->meta, AMEDIAFORMAT_KEY_MIME,  MEDIA_MIMETYPE_VIDEO_HEVC);//"video/hevc");//mFormatCtx->streams[stream_id]->codec->codec_id); 
+            AMediaFormat_setInt32(track->meta, AMEDIAFORMAT_KEY_WIDTH,  mFormatCtx->streams[stream_id]->codec->width); 
+            AMediaFormat_setInt32(track->meta, AMEDIAFORMAT_KEY_HEIGHT,  mFormatCtx->streams[stream_id]->codec->height); 
+            if (mFormatCtx->streams[stream_id]->codec->bit_rate > 0){
+                AMediaFormat_setInt32(track->meta, AMEDIAFORMAT_KEY_BIT_RATE,  mFormatCtx->streams[stream_id]->codec->bit_rate); 
+            }
+
+            if (mFormatCtx->streams[stream_id]->codec->extradata_size > 0) {
+                ALOGD("%s %d have extradata");
+//                meta->setData(kKeyRawCodecSpecificData, 0, avctx->extradata, avctx->extradata_size);
+            }
+            
+            //mDefersToCreateVideoTrack = false;
+            break;
         }
 
-        if (avctx->extradata) {
-            ALOGV("audio stream extradata(%d):", avctx->extradata_size);
-            //hexdump(avctx->extradata, avctx->extradata_size);
-        } else {
-            ALOGV("audio stream no extradata, but we can ignore it.");
+        case AVMEDIA_TYPE_AUDIO: {
+            if (mAudioStreamIdx == -1)
+                mAudioStreamIdx = stream_id;
+            if (mAudioStream == NULL)
+                mAudioStream = mFormatCtx->streams[stream_id];
+            if (codec_param->extradata) {
+                ALOGV("audio stream extradata(%d):", codec_param->extradata_size);
+                //hexdump(codec_param->extradata, codec_param->extradata_size);
+            } else {
+                ALOGV("audio stream no extradata, but we can ignore it.");
+            }
+            ALOGD("create a audio track");
+
+            Track *track = new Track;
+            if (mLastTrack != NULL) {
+                mLastTrack->next = track;
+            } else {
+                mFirstTrack = track;
+            }
+            mLastTrack = track;
+            
+            track->meta = AMediaFormat_new();
+            track->timescale = 1000000;
+            track->trackId = stream_id;
+            track->mStream = mAudioStream;
+            AMediaFormat_setInt32(track->meta, AMEDIAFORMAT_KEY_TRACK_ID, stream_id); 
+            AMediaFormat_setString(track->meta, AMEDIAFORMAT_KEY_MIME,  MEDIA_MIMETYPE_AUDIO_AAC);//mFormatCtx->streams[stream_id]->codec->codec_id); 
+            AMediaFormat_setInt32(track->meta, AMEDIAFORMAT_KEY_CHANNEL_COUNT,  mFormatCtx->streams[stream_id]->codec->channels); 
+            AMediaFormat_setInt32(track->meta, AMEDIAFORMAT_KEY_BITS_PER_SAMPLE,  mFormatCtx->streams[stream_id]->codec->bits_per_coded_sample); 
+            AMediaFormat_setInt32(track->meta, AMEDIAFORMAT_KEY_BIT_RATE, mFormatCtx->streams[stream_id]->codec->bit_rate); 
+            AMediaFormat_setInt32(track->meta, AMEDIAFORMAT_KEY_SAMPLE_RATE, mFormatCtx->streams[stream_id]->codec->sample_rate); 
+            
+
+            if (mFormatCtx->streams[stream_id]->codec->extradata_size > 0) {
+                ALOGD("have extradata");
+//                meta->setData(kKeyRawCodecSpecificData, 0, avctx->extradata, avctx->extradata_size);
+            }
+
+            break;
+        }
+        case AVMEDIA_TYPE_SUBTITLE:
+            
+            CHECK(!"Should not be here. Unsupported media type.");
+            break;
+        default:
+            CHECK(!"Should not be here. Unsupported media type.");
+            break;
         }
 
-//        meta = setAudioFormat(mAudioStream);
-//        if (meta == NULL) {
-//            ALOGE("setAudioFormat failed");
-//            return -1;
-//        }
-
-        ALOGV("create a audio track");
-        mTracks.push();
-        trackInfo = &mTracks.editItemAt(mTracks.size() - 1);
-        trackInfo->trackId  = stream_index;
-        trackInfo->meta   = meta;
-        trackInfo->mStream = mAudioStream;
-        trackInfo->mQueue  = &mAudioQ;
-
-        mDefersToCreateAudioTrack = false;
-
-        break;
-    case AVMEDIA_TYPE_SUBTITLE:
-        
-        CHECK(!"Should not be here. Unsupported media type.");
-        break;
-    default:
-        CHECK(!"Should not be here. Unsupported media type.");
-        break;
-    }
-*/
     return 0;
 }
 
-
-////////////////////////////////////////////////////////////////////////////////
-
-FFmpegSource::FFmpegSource(
-        AMediaFormat *format,
-        FFmpegExtractor *extractor,
-        uint32_t trackId, int32_t timeScale)
-    {
-
-}
-
-FFmpegSource::~FFmpegSource() {
-
-}
-
-media_status_t FFmpegSource::start() {
-    return AMEDIA_OK;
-}
-
-media_status_t FFmpegSource::stop() {
-    return AMEDIA_OK;
-}
-
-media_status_t FFmpegSource::getFormat(AMediaFormat *meta) {
-    return AMEDIA_OK;
-}
-
-media_status_t FFmpegSource::read(
-        MediaBufferHelper **buffer, const ReadOptions *options) {
-
-    return AMEDIA_OK;
-}
-
-////////////////////////////////////////////////////////////////////////////////
 
 static CMediaExtractor* CreateExtractor(CDataSource *source, void *) {
     return wrap(new FFmpegExtractor(new DataSourceHelper(source)));
@@ -744,12 +1037,20 @@ void deInitFFmpeg()
 
 int fill_iobuffer(void *opaque, uint8_t *buf, int read_size)
 {
-     buffer_data *bd = (buffer_data *)opaque;
+    buffer_data *bd = (buffer_data *)opaque;
+
+    ALOGE("%s %d opaque %p, buf %p readsize %d, filesize %d offset %d,source %p",__FUNCTION__,__LINE__,opaque, buf, read_size,bd->size,bd->offset,bd->source);
+    if (bd->offset < 0 || bd->size < bd->offset) {
+        ALOGE("%s %d return bad size AVERROR_EOF %d",__FUNCTION__, __LINE__,AVERROR_EOF);
+        return AVERROR_EOF;
+    }
+
      read_size = read_size < (bd->size - bd->offset) ? read_size : (bd->size - bd->offset);
-     if (!read_size) {
-        ALOGE("%s %d return eos AVERROR_EOF",__FUNCTION__, __LINE__,AVERROR_EOF);
+     if (read_size <= 0) {
+        ALOGE("%s %d return eos AVERROR_EOF %d",__FUNCTION__, __LINE__,AVERROR_EOF);
         return AVERROR_EOF;
      }
+     ALOGE("%s %d return eos AVERROR_EOF %d,read_size %d, (bd->size - bd->offset) %d",__FUNCTION__, __LINE__,AVERROR_EOF,read_size , (bd->size - bd->offset));
      // binder call time cost ? 
      if (bd->source->readAt(bd->offset, buf, read_size) < read_size) {
          ALOGE(" file read size %d",read_size);
@@ -757,13 +1058,35 @@ int fill_iobuffer(void *opaque, uint8_t *buf, int read_size)
          return AVERROR_BUFFER_TOO_SMALL;
      }
     bd->offset += read_size;
-    ALOGI("fill_iobuffer dst %02x %02x %02x %02x %02x %02x %02x %02x    %02x %02x %02x %02x %02x %02x %02x %02x",
+    //bd->offset = bd->offset < bd->size ? bd->offset : bd->size;
+    ALOGD("fill_iobuffer read_size %d dst %02x %02x %02x %02x %02x %02x %02x %02x    %02x %02x %02x %02x %02x %02x %02x %02x",read_size,
        *(buf),*(buf+1),*(buf+2),*(buf+3),*(buf+4),*(buf+5),*(buf+6),*(buf+7),
        *(buf+8),*(buf+9),*(buf+10),*(buf+11),*(buf+12),*(buf+13),*(buf+14),*(buf+15));
 
     return read_size;
 }
 
+int64_t seek_iobuffer(void *opaque, int64_t offset, int whence)
+{
+    buffer_data *bd = (buffer_data *)opaque;
+    int64_t ret = -1;
+
+    ALOGE("%s %d,opaque %p,  whence %d,offset %lld,bd %p,bd->size %d,source %p",__FUNCTION__, __LINE__,opaque,whence,(long long)offset,bd, bd->size,bd->source);
+    switch (whence) {
+    case AVSEEK_SIZE:
+        ret =  bd->size;
+        break;
+    case SEEK_SET:
+        bd->offset += offset;
+        ret = (int64_t)bd;
+        //ret = (int64_t)bd->source;
+        break;
+    default:
+        ALOGE("%s %d  AVERROR_OPTION_NOT_FOUND",__FUNCTION__, __LINE__);
+        break;
+    }
+    return ret;
+}
 
 static bool SniffFFMPEGCommon(DataSourceHelper *source, float *confidence,const char *url) 
 {
@@ -799,13 +1122,13 @@ static bool SniffFFMPEGCommon(DataSourceHelper *source, float *confidence,const 
     //source->getSize(&getsize);
     //file_data.size = getsize;
     //ALOGE(" file ptr %p , size %d ",file_data.ptr,file_data.size);
-    iobuffer = (uint8_t *)av_malloc(65536);
+    iobuffer = (uint8_t *)av_malloc(SIZE_64KB);
     if (!iobuffer) {
         ret = AVERROR(ENOMEM);
         goto fail;
     }
 
-    avio = avio_alloc_context(iobuffer, 65536, 0, &file_data, fill_iobuffer, NULL, NULL);
+    avio = avio_alloc_context(iobuffer, SIZE_64KB, 0, &file_data, fill_iobuffer, NULL, NULL);
     if (!avio) {
         ret = AVERROR(ENOMEM);
         goto fail;
@@ -895,14 +1218,14 @@ static bool SniffFFMPEGLocal(DataSourceHelper *source, float *confidence)
     file_data.source = source;
     file_data.offset = 0;
     
-    ALOGE("file offset %d , size %d file_data.source %p",file_data.offset,file_data.size,file_data.source);
-    iobuffer = (uint8_t *)av_malloc(65536);
+    ALOGE("%s %d file offset %d , size %d file_data.source %p",__FUNCTION__,__LINE__,file_data.offset,file_data.size,file_data.source);
+    iobuffer = (uint8_t *)av_malloc(SIZE_64KB);
     if (!iobuffer) {
         ret = AVERROR(ENOMEM);
         goto fail;
     }
 
-    avio = avio_alloc_context(iobuffer, 65536, 0, &file_data, fill_iobuffer, NULL, NULL);
+    avio = avio_alloc_context(iobuffer, SIZE_64KB, 0, &file_data, fill_iobuffer, NULL, NULL);
     if (!avio) {
         ret = AVERROR(ENOMEM);
         goto fail;
@@ -920,7 +1243,7 @@ static bool SniffFFMPEGLocal(DataSourceHelper *source, float *confidence)
     //opts = setup_find_stream_info_opts(ic, codec_opts);
     nb_streams = ic->nb_streams;
     //add by Vinter, limit timecost when find stream info
-    ic->probesize = 64 * 1024;
+    ic->probesize = SIZE_64KB;
     ic->max_analyze_duration = AV_TIME_BASE;
     err = avformat_find_stream_info(ic, opts);
     if (err < 0) {

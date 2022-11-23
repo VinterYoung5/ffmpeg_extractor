@@ -20,6 +20,11 @@
 
 #include <media/stagefright/foundation/ABase.h>
 #include <media/stagefright/MediaExtractor.h>
+
+#include <media/MediaExtractorPluginHelper.h>
+#include <media/MediaExtractorPluginApi.h>
+
+
 #include <utils/threads.h>
 #include <utils/KeyedVector.h>
 
@@ -58,6 +63,7 @@ const char *MEDIA_MIMETYPE_VIDEO_FFMPEG = "video/ffmpeg";
 const char *MEDIA_MIMETYPE_AUDIO_FFMPEG = "audio/ffmpeg";
 
 namespace android {
+class DataSourceHelper;
 
 typedef struct PacketQueue {
     AVPacket flush_pkt;
@@ -68,6 +74,16 @@ typedef struct PacketQueue {
     pthread_mutex_t mutex;
     pthread_cond_t cond;
 } PacketQueue;
+
+
+
+typedef struct
+{
+    size_t size; 
+    size_t offset;
+    DataSourceHelper *source;
+}buffer_data;
+
 void packet_queue_init(PacketQueue *q);
 void packet_queue_destroy(PacketQueue *q);
 void packet_queue_flush(PacketQueue *q);
@@ -78,13 +94,13 @@ int packet_queue_put_nullpacket(PacketQueue *q, int stream_index);
 int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block);
 media_status_t initFFmpeg();
 int fill_iobuffer(void *opaque, uint8_t *buf, int buf_size);
+int64_t seek_iobuffer(void *opaque, int64_t offset, int whence);
 
 
 void deInitFFmpeg();
 
 struct ABuffer;
 struct AMessage;
-struct FFmpegSource;
 
 struct FFmpegExtractor : public MediaExtractorPluginHelper {
     explicit FFmpegExtractor(DataSourceHelper *source);
@@ -109,10 +125,25 @@ private:
         AMediaFormat *meta;
         uint32_t trackId; //stream index
         uint32_t timescale;
-    //yangwen add
-    AVStream *mStream;
-    PacketQueue *mQueue;
-    //yangwen add end
+        //yangwen add
+        AVStream *mStream;
+        PacketQueue *mQueue;
+        
+
+        Track(){
+            next = NULL;
+            meta = NULL;
+            mStream = NULL;
+            mQueue  = NULL;
+        }
+        ~Track() {
+            if (meta) {
+                AMediaFormat_delete(meta);
+                meta = NULL;
+            }
+        }
+        //yangwen add end
+    
     };
 
     Track *mFirstTrack, *mLastTrack;
@@ -120,6 +151,10 @@ private:
     AMediaFormat *mFileMetaData;
 
 //yangwen add
+int mVideoStreamIdx;
+int mAudioStreamIdx;
+size_t mProbePkts;
+
 bool mEOF;
 AVFormatContext *mFormatCtx;
 bool mFFmpegInited;
@@ -132,12 +167,16 @@ status_t mInitCheck;
 int mAbortRequest;
 int64_t mDuration;
 int mSeekByBytes;
+int mShowStatus;
+buffer_data mIoData;
+
 int initStreams();
 void deInitStreams();
 
 static int decode_interrupt_cb(void *ctx);
 void initFFmpegDefaultOpts();
 int stream_component_open(int stream_index);
+status_t readMetaData();
 
 //yangwen add endd
 
@@ -145,33 +184,6 @@ int stream_component_open(int stream_index);
     FFmpegExtractor &operator=(const FFmpegExtractor &);
 
 };
-
-
-struct FFmpegSource : public MediaTrackHelper {
-    FFmpegSource(AMediaFormat *format, FFmpegExtractor *extractor, uint32_t trackId, int32_t timeScale);
-
-    virtual media_status_t start();
-    virtual media_status_t stop();
-    virtual media_status_t getFormat(AMediaFormat *meta);
-    virtual media_status_t read(
-            MediaBufferHelper **buffer, const ReadOptions *options);
-
-protected:
-    virtual ~FFmpegSource();
-
-private:
-    friend struct FFmpegExtractor;
-    int32_t mTimescale;
-
-
-    FFmpegExtractor *mExtractor;
-    uint32_t mTrackId;
-
-    FFmpegSource(const FFmpegSource &);
-    FFmpegSource &operator=(const FFmpegSource &);
-
-};
-
 
 
 
