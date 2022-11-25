@@ -79,9 +79,9 @@ typedef struct PacketQueue {
 
 typedef struct
 {
+    DataSourceHelper *source;
     size_t size; 
     size_t offset;
-    DataSourceHelper *source;
 }buffer_data;
 
 void packet_queue_init(PacketQueue *q);

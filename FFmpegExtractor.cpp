@@ -129,7 +129,7 @@ FFmpegSource::FFmpegSource(
         ALOGE("%s %d,source %p",__FUNCTION__,__LINE__,mSourceIoData->source);
     }
     bool success = AMediaFormat_getString(mFormat, AMEDIAFORMAT_KEY_MIME, &mime);
-    ALOGE("%s %d, trackid %d ,mime %s,this %p,formatctx %p",__FUNCTION__,__LINE__,trackId,mime,this,fc);
+    ALOGE("%s %d, trackid %d ,mime %s,this %p,formatctx %p,dataSource %p",__FUNCTION__,__LINE__,trackId,mime,this,fc,dataSource);
     
 }
 
@@ -244,6 +244,7 @@ media_status_t FFmpegSource::read(
         } else{ 
             ALOGD("[%s %d] audio w %d, h %d",__FUNCTION__,__LINE__,sourceFormatContext->streams[mTrackId]->codec->width,sourceFormatContext->streams[mTrackId]->codec->height);
         }
+
         ret = av_read_frame(sourceFormatContext, pkt);
         if (ret == AVERROR_EOF) {
             eof = 1;
@@ -260,7 +261,6 @@ media_status_t FFmpegSource::read(
         ALOGD("read success");
         if (pkt->stream_index == mTrackId) {
 
-        
         }
 
         err = mBufferGroup->acquire_buffer(&mBuffer);
@@ -297,7 +297,7 @@ FFmpegExtractor::FFmpegExtractor(DataSourceHelper *source)
         return;
     }
     mShowStatus = 1;
-    mIoData.source = NULL;
+    //mIoData.source = NULL;
 
     // start reader here, as we want to extract extradata from bitstream if no extradata
     //startReaderThread();
