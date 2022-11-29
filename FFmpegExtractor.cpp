@@ -203,8 +203,11 @@ media_status_t FFmpegSource::read(
     int ret = 0;
     int eof = 0;
     int read  = 0;
+    int64_t pktTS = AV_NOPTS_VALUE;
+    int key = 0;
     status_t err;
     AVCodecContext *avctx = NULL;
+    AMediaFormat *meta = NULL;
     CHECK(mStarted);
     if (options != nullptr && options->getNonBlocking() && !mBufferGroup->has_buffers()) {
         ALOGE("%s %d",__FUNCTION__,__LINE__);
@@ -250,12 +253,15 @@ media_status_t FFmpegSource::read(
             eof = 1;
             mEOF = true;
             ALOGD("ret == AVERROR_EOF");
+            av_free_packet(pkt);
             return AMEDIA_ERROR_END_OF_STREAM  ;
         } else if (ret == EAGAIN) {
+            av_free_packet(pkt);
             return AMEDIA_OK;
 
         } else if (ret < 0) {
             ALOGD("ret 0x%x return AMEDIA_ERROR_UNKNOWN %d %d",ret,sourceFormatContext->streams[mTrackId]->codec->width,sourceFormatContext->streams[mTrackId]->codec->height);
+            av_free_packet(pkt);
             return AMEDIA_ERROR_UNKNOWN;
         }
         ALOGD("read success");
@@ -266,16 +272,44 @@ media_status_t FFmpegSource::read(
         err = mBufferGroup->acquire_buffer(&mBuffer);
         if (err != OK) {
             CHECK(mBuffer == NULL);
+            av_free_packet(pkt);
             return AMEDIA_ERROR_UNKNOWN;
         }
         if (pkt->size > mBuffer->size()) {
             //ALOGE("buffer too small: pkt %zu > buffer %zu", pkt->size, mBuffer->size());
             mBuffer->release();
             mBuffer = NULL;
+            av_free_packet(pkt);
             return AMEDIA_ERROR_UNKNOWN; // ERROR_BUFFER_TOO_SMALL
         }
 
     }
+
+    {
+        
+       
+       memcpy(mBuffer->data(), pkt->data, pkt->size);
+
+       key = pkt->flags & AV_PKT_FLAG_KEY ? 1 : 0;
+       pktTS = pkt->pts;
+       if (pkt->pts == AV_NOPTS_VALUE) {
+           pktTS = pkt->dts;
+       }
+        meta = mBuffer->meta_data();
+        AMediaFormat_clear(meta);
+        AMediaFormat_setInt64(
+                meta, AMEDIAFORMAT_KEY_TIME_US, ((long double)pktTS * 1000000) / mTimescale);
+        AMediaFormat_setInt32(
+                meta, AMEDIAFORMAT_KEY_IS_SYNC_FRAME, key);
+       
+       ALOGD("read pkt, size:%d, key:%d, pts:%lld, dts:%lld",
+                 pkt->size, key, pkt->pts, pkt->dts);
+       *out = mBuffer;
+       mBuffer = NULL;
+       av_free_packet(pkt);
+   }
+    
+    
     return AMEDIA_OK;
 }
 
@@ -701,7 +735,7 @@ int FFmpegExtractor::stream_component_open(int stream_id)
             track->trackId = stream_id;
             track->mStream = mVideoStream;
             AMediaFormat_setInt32(track->meta, AMEDIAFORMAT_KEY_TRACK_ID, stream_id); 
-            AMediaFormat_setString(track->meta, AMEDIAFORMAT_KEY_MIME,  MEDIA_MIMETYPE_VIDEO_HEVC);//"video/hevc");//mFormatCtx->streams[stream_id]->codec->codec_id); 
+            AMediaFormat_setString(track->meta, AMEDIAFORMAT_KEY_MIME,  MEDIA_MIMETYPE_VIDEO_AVC);//"video/hevc");//mFormatCtx->streams[stream_id]->codec->codec_id); 
             AMediaFormat_setInt32(track->meta, AMEDIAFORMAT_KEY_WIDTH,  mFormatCtx->streams[stream_id]->codec->width); 
             AMediaFormat_setInt32(track->meta, AMEDIAFORMAT_KEY_HEIGHT,  mFormatCtx->streams[stream_id]->codec->height); 
             if (mFormatCtx->streams[stream_id]->codec->bit_rate > 0){
@@ -1047,10 +1081,10 @@ int fill_iobuffer(void *opaque, uint8_t *buf, int read_size)
 
      read_size = read_size < (bd->size - bd->offset) ? read_size : (bd->size - bd->offset);
      if (read_size <= 0) {
-        ALOGE("%s %d return eos AVERROR_EOF %d",__FUNCTION__, __LINE__,AVERROR_EOF);
+        ALOGE("%s %d return eos",__FUNCTION__, __LINE__);
         return AVERROR_EOF;
      }
-     ALOGE("%s %d return eos AVERROR_EOF %d,read_size %d, (bd->size - bd->offset) %d",__FUNCTION__, __LINE__,AVERROR_EOF,read_size , (bd->size - bd->offset));
+     //ALOGE("%s %d return eos ,read_size %d, (bd->size - bd->offset) %d",__FUNCTION__, __LINE__,read_size , (bd->size - bd->offset));
      // binder call time cost ? 
      if (bd->source->readAt(bd->offset, buf, read_size) < read_size) {
          ALOGE(" file read size %d",read_size);
@@ -1058,10 +1092,11 @@ int fill_iobuffer(void *opaque, uint8_t *buf, int read_size)
          return AVERROR_BUFFER_TOO_SMALL;
      }
     bd->offset += read_size;
+    ALOGE("%s %d offset %d",__FUNCTION__, __LINE__,bd->offset);
     //bd->offset = bd->offset < bd->size ? bd->offset : bd->size;
-    ALOGD("fill_iobuffer read_size %d dst %02x %02x %02x %02x %02x %02x %02x %02x    %02x %02x %02x %02x %02x %02x %02x %02x",read_size,
-       *(buf),*(buf+1),*(buf+2),*(buf+3),*(buf+4),*(buf+5),*(buf+6),*(buf+7),
-       *(buf+8),*(buf+9),*(buf+10),*(buf+11),*(buf+12),*(buf+13),*(buf+14),*(buf+15));
+//    ALOGD("fill_iobuffer read_size %d dst %02x %02x %02x %02x %02x %02x %02x %02x    %02x %02x %02x %02x %02x %02x %02x %02x",read_size,
+//       *(buf),*(buf+1),*(buf+2),*(buf+3),*(buf+4),*(buf+5),*(buf+6),*(buf+7),
+//       *(buf+8),*(buf+9),*(buf+10),*(buf+11),*(buf+12),*(buf+13),*(buf+14),*(buf+15));
 
     return read_size;
 }
@@ -1071,20 +1106,21 @@ int64_t seek_iobuffer(void *opaque, int64_t offset, int whence)
     buffer_data *bd = (buffer_data *)opaque;
     int64_t ret = -1;
 
-    ALOGE("%s %d,opaque %p,  whence %d,offset %lld,bd %p,bd->size %d,source %p",__FUNCTION__, __LINE__,opaque,whence,(long long)offset,bd, bd->size,bd->source);
     switch (whence) {
     case AVSEEK_SIZE:
         ret =  bd->size;
         break;
     case SEEK_SET:
-        bd->offset += offset;
-        ret = (int64_t)bd;
+        bd->offset = offset;
+        ret = (int64_t)bd->offset;
         //ret = (int64_t)bd->source;
         break;
     default:
         ALOGE("%s %d  AVERROR_OPTION_NOT_FOUND",__FUNCTION__, __LINE__);
         break;
     }
+    ALOGE("%s %d,opaque %p,  whence %d,readoffset %lld,bd %p,bd->size %d,source %p,bd->offset %d,ret 0x%llx",__FUNCTION__, __LINE__,opaque,whence,(long long)offset,bd, bd->size,bd->source,bd->offset,ret);
+    
     return ret;
 }
 
