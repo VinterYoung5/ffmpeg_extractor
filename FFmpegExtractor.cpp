@@ -39,6 +39,7 @@
 #include <media/stagefright/foundation/AudioPresentationInfo.h>
 #include <media/stagefright/foundation/ColorUtils.h>
 #include <media/stagefright/foundation/MediaDefs.h>
+#include <media/stagefright/foundation/hexdump.h>
 
 
 #include "FFmpegExtractor.h"
@@ -69,7 +70,7 @@ namespace android {
 
 class FFmpegSource : public MediaTrackHelper {
 public:
-    explicit FFmpegSource(AMediaFormat *format, DataSourceHelper *dataSource, uint32_t trackId, int32_t timeScale, buffer_data *mData,AVFormatContext *fc);
+    explicit FFmpegSource(AMediaFormat *format, DataSourceHelper *dataSource, uint32_t trackId, Ffmpeg_stream_info *stream, buffer_data *mData,AVFormatContext *fc);
     virtual status_t init();
 
     virtual media_status_t start();
@@ -90,6 +91,7 @@ private:
     AMediaFormat *mFormat;
     DataSourceHelper *mDataSource;
     buffer_data *mSourceIoData;
+    Ffmpeg_stream_info stream_info;
     int32_t mTimescale;
     bool mStarted;
     bool mIsHeif;
@@ -108,7 +110,7 @@ FFmpegSource::FFmpegSource(
         AMediaFormat *format,
          DataSourceHelper *dataSource,
         uint32_t trackId, 
-        int32_t timeScale,
+        Ffmpeg_stream_info *streamInfo,
         buffer_data  *mData,
         AVFormatContext *fc)
     : mFormat(format),
@@ -118,19 +120,19 @@ FFmpegSource::FFmpegSource(
       mTrackId(trackId),
       mIsAvif(false),
       mEOF(false),
-      sourceFormatContext(fc),
-      mTimescale(timeScale)
+      sourceFormatContext(fc)
     {
     ALOGE("%s %d",__FUNCTION__,__LINE__);
     const char *mime;
     mSourceIoData = NULL;
+    stream_info.is_annexb = streamInfo->is_annexb;
+    stream_info.bsf_ctx   = streamInfo->bsf_ctx;
     if (!mData) {
         mSourceIoData->source = mData->source;
         ALOGE("%s %d,source %p",__FUNCTION__,__LINE__,mSourceIoData->source);
     }
     bool success = AMediaFormat_getString(mFormat, AMEDIAFORMAT_KEY_MIME, &mime);
-    ALOGE("%s %d, trackid %d ,mime %s,this %p,formatctx %p,dataSource %p",__FUNCTION__,__LINE__,trackId,mime,this,fc,dataSource);
-    
+    ALOGE("%s %d, trackid %d ,mime %s,this %p,formatctx %p,dataSource %p, annexb %d bsf %p",__FUNCTION__,__LINE__,trackId,mime,this,fc,dataSource,stream_info.is_annexb,stream_info.bsf_ctx);
 }
 
 FFmpegSource::~FFmpegSource() {
@@ -275,6 +277,7 @@ media_status_t FFmpegSource::read(
             av_free_packet(pkt);
             return AMEDIA_ERROR_UNKNOWN;
         }
+        ALOGE("acquire_buffer: pkt %zu  buffer %zu", pkt->size, mBuffer->size());
         if (pkt->size > mBuffer->size()) {
             //ALOGE("buffer too small: pkt %zu > buffer %zu", pkt->size, mBuffer->size());
             mBuffer->release();
@@ -284,10 +287,32 @@ media_status_t FFmpegSource::read(
         }
 
     }
+    ALOGD("raw read pkt, size:%d, key:%d, pts:%lld, dts:%lld",pkt->size, key, pkt->pts, pkt->dts);
+
+    if (sourceFormatContext->streams[mTrackId]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+        
+        if (!stream_info.is_annexb) {
+            if (ret = av_bsf_send_packet(stream_info.bsf_ctx, eof ? NULL : pkt) < 0) {
+                ALOGD("av_bsf_send_packet failed, ret=%d\n", ret);
+                return AMEDIA_ERROR_UNKNOWN;
+            } 
+            while (true) {
+                ret = av_bsf_receive_packet(stream_info.bsf_ctx, pkt);
+                if (ret == AVERROR_EOF) {
+
+                } else if (ret == AVERROR(EAGAIN)) {
+                    
+                } 
+                ALOGD("filter read pkt, size:%d, key:%d, pts:%lld, dts:%lld,ret %d", pkt->size, key, pkt->pts, pkt->dts,ret);
+                if (ret) break;
+                //av_packet_unref(pkt);
+            }
+        }
+    }
 
     {
-        
-       
+        hexdump(pkt->data,pkt->size < 16 ? pkt->size : 16);
+
        memcpy(mBuffer->data(), pkt->data, pkt->size);
 
        key = pkt->flags & AV_PKT_FLAG_KEY ? 1 : 0;
@@ -298,13 +323,14 @@ media_status_t FFmpegSource::read(
         meta = mBuffer->meta_data();
         AMediaFormat_clear(meta);
         AMediaFormat_setInt64(
-                meta, AMEDIAFORMAT_KEY_TIME_US, ((long double)pktTS * 1000000) / mTimescale);
+                meta, AMEDIAFORMAT_KEY_TIME_US, ((long double)pktTS * 100));
         AMediaFormat_setInt32(
                 meta, AMEDIAFORMAT_KEY_IS_SYNC_FRAME, key);
        
        ALOGD("read pkt, size:%d, key:%d, pts:%lld, dts:%lld",
                  pkt->size, key, pkt->pts, pkt->dts);
        *out = mBuffer;
+
        mBuffer = NULL;
        av_free_packet(pkt);
    }
@@ -324,6 +350,8 @@ FFmpegExtractor::FFmpegExtractor(DataSourceHelper *source)
       mLastTrack(NULL) 
 {
     ALOGD("FFmpegExtractor::FFmpegExtractor");
+    mStream_info = {0};
+    
     mFileMetaData = AMediaFormat_new();
     int ret = initStreams();
     if (ret < 0) {
@@ -346,6 +374,8 @@ FFmpegExtractor::FFmpegExtractor(DataSourceHelper *source)
     ALOGV("mProbePkts: %d, mEOF: %d, pb->error(if has): %d, mDefersToCreateVideoTrack: %d, mDefersToCreateAudioTrack: %d",
         mProbePkts, mEOF, mFormatCtx->pb ? mFormatCtx->pb->error : 0, mDefersToCreateVideoTrack, mDefersToCreateAudioTrack);
 */
+    ALOGE("%s %d annexb %d, %p",__FUNCTION__,__LINE__,mStream_info.is_annexb,&mStream_info);
+
     mInitCheck = OK;
 }
 
@@ -405,8 +435,9 @@ MediaTrackHelper* FFmpegExtractor::getTrack(size_t index) {
     if (!AMediaFormat_getString(track->meta, AMEDIAFORMAT_KEY_MIME, &mime)) {
         return NULL;
     }
+    ALOGD("%s %d,is_annexb %d,stream %p",__FUNCTION__,__LINE__,mStream_info.is_annexb,&mStream_info);
 
-    FFmpegSource* source = new FFmpegSource(track->meta, mDataSource, track->trackId, track->timescale, &mIoData, mFormatCtx);
+    FFmpegSource* source = new FFmpegSource(track->meta, mDataSource, track->trackId, &mStream_info, &mIoData, mFormatCtx);
     return source;
 }
 
@@ -613,6 +644,31 @@ int FFmpegExtractor::initStreams()
         video_ret = stream_component_open(st_index[AVMEDIA_TYPE_VIDEO]);
     }
 
+    if (mFormatCtx->streams[st_index[AVMEDIA_TYPE_VIDEO]]->codecpar->codec_id == AV_CODEC_ID_H264) {
+        mStream_info.is_annexb = strcmp(av_fourcc2str(mFormatCtx->streams[st_index[AVMEDIA_TYPE_VIDEO]]->codecpar->codec_tag), "avc1") == 0 ? false : true; //0x31637661 = "avc1"
+        
+//        ALOGD("is_annexb %d", mStream_info.is_annexb);  
+//        if (mFormatCtx->streams[st_index[AVMEDIA_TYPE_VIDEO]]->codecpar->codec_tag == 0x31637661) {//avc1: nalusize+naludata :avcc mode
+//            mStream_info.is_annexb = false;
+//        } else if (mFormatCtx->streams[st_index[AVMEDIA_TYPE_VIDEO]]->codecpar->codec_tag == 0x34363248) {//h264:startcode+naludata:annexb mode
+//            mStream_info.is_annexb = true;
+//        }
+
+        if (!mStream_info.is_annexb) {
+            if (ret = open_bitstream_filter(mVideoStream, &mStream_info.bsf_ctx, "h264_mp4toannexb") < 0) {
+                ALOGD("open_bitstream_filter failed, ret=%d", ret);  
+                return -1;
+            } else {
+                ALOGD("open_bitstream_filter success"); 
+            }
+        }
+        ALOGD("avc1, need to convert to annexb  0x%x, extra size %d,mStream_info.is_annexb %d bsf %p",
+            mFormatCtx->streams[st_index[AVMEDIA_TYPE_VIDEO]]->codecpar->codec_tag,
+            mFormatCtx->streams[st_index[AVMEDIA_TYPE_VIDEO]]->codecpar->extradata_size,
+            mStream_info.is_annexb,mStream_info.bsf_ctx);   
+    }
+    
+
     AMediaFormat_setString(mFileMetaData,
             AMEDIAFORMAT_KEY_MIME, MEDIA_MIMETYPE_CONTAINER_MPEG4);
     if (mDuration != 0) {
@@ -643,6 +699,113 @@ void FFmpegExtractor::deInitStreams()
     }
 }
 
+int FFmpegExtractor::open_bitstream_filter(AVStream *stream, AVBSFContext **bsf_ctx, const char *name) {
+    int ret = 0;
+    const AVBitStreamFilter *filter = av_bsf_get_by_name(name);
+    if (!filter) {
+        ret = -1;
+        ALOGE("Unknow bitstream filter");
+    }
+    if((ret = av_bsf_alloc(filter, bsf_ctx) < 0)) {
+        ALOGE("av_bsf_alloc failed");
+        return ret;
+    }
+    if ((ret = avcodec_parameters_copy((*bsf_ctx)->par_in, stream->codecpar)) < 0) {
+        ALOGE("avcodec_parameters_copy failed, ret=%d\n", ret);
+        return ret;
+    }
+    if ((ret = av_bsf_init(*bsf_ctx)) < 0) {
+        ALOGE("av_bsf_init failed, ret=%d", ret);       
+        return ret;
+    }
+    return ret;
+}
+const char *codecId2MimeType(enum AVCodecID id) {
+    const char * mime = NULL;
+    switch (id) {
+        case AV_CODEC_ID_MPEG2VIDEO:
+            mime = MEDIA_MIMETYPE_VIDEO_MPEG2;
+            break;
+        case AV_CODEC_ID_MPEG4:
+            mime = MEDIA_MIMETYPE_VIDEO_MPEG4;
+            break;
+        case AV_CODEC_ID_RAWVIDEO:
+            mime = MEDIA_MIMETYPE_VIDEO_RAW;
+            break;
+        case AV_CODEC_ID_H263P:
+            mime = MEDIA_MIMETYPE_VIDEO_H263;
+            break;
+        case AV_CODEC_ID_H263I:
+            mime = MEDIA_MIMETYPE_VIDEO_H263;
+            break;
+        case AV_CODEC_ID_H264:
+            mime = MEDIA_MIMETYPE_VIDEO_AVC;
+            break;
+        case AV_CODEC_ID_VP8:
+            mime = MEDIA_MIMETYPE_VIDEO_VP8;
+            break;
+        case AV_CODEC_ID_VP9:
+            mime = MEDIA_MIMETYPE_VIDEO_VP9;
+            break;
+        case AV_CODEC_ID_HEVC:
+            mime = MEDIA_MIMETYPE_VIDEO_HEVC;
+            break;
+        case AV_CODEC_ID_AV1:
+            mime = MEDIA_MIMETYPE_VIDEO_AV1;
+            break;
+        case AV_CODEC_ID_VVC:
+            mime = "video/hvvc";
+            break;
+        //audio
+
+        case AV_CODEC_ID_AAC:
+        case AV_CODEC_ID_AAC_LATM:
+            mime = MEDIA_MIMETYPE_AUDIO_AAC;
+            break;
+        
+        case AV_CODEC_ID_QCELP:
+            mime = MEDIA_MIMETYPE_AUDIO_QCELP;
+            break;
+        case AV_CODEC_ID_VORBIS:
+            mime = MEDIA_MIMETYPE_AUDIO_VORBIS;
+            break;
+        case AV_CODEC_ID_OPUS:
+            mime = MEDIA_MIMETYPE_AUDIO_OPUS;
+            break;
+        case AV_CODEC_ID_PCM_ALAW:
+            mime = MEDIA_MIMETYPE_AUDIO_G711_ALAW;
+            break;
+        case AV_CODEC_ID_FLAC:
+            mime = MEDIA_MIMETYPE_AUDIO_FLAC;
+            break;
+        case AV_CODEC_ID_AC3:
+            mime = MEDIA_MIMETYPE_AUDIO_AC3;
+            break;
+        case AV_CODEC_ID_EAC3:
+            mime = MEDIA_MIMETYPE_AUDIO_EAC3;
+            break;
+        case AV_CODEC_ID_ALAC:
+            mime = MEDIA_MIMETYPE_AUDIO_ALAC;
+            break;
+        case AV_CODEC_ID_WMAV1:
+        case AV_CODEC_ID_WMAV2:
+        case AV_CODEC_ID_WMAPRO:
+        case AV_CODEC_ID_WMALOSSLESS:
+            mime = MEDIA_MIMETYPE_AUDIO_WMA;
+            break;
+        case AV_CODEC_ID_DTS:
+            mime = MEDIA_MIMETYPE_AUDIO_DTS;
+            break;
+
+        default:
+            mime  = "unknown_codec";
+            break;
+    }
+    return mime;
+}
+
+//int FFmpegExtractor::getMimetypeByCodecId(int stream_id)
+
 int FFmpegExtractor::stream_component_open(int stream_id)
 {
 
@@ -653,6 +816,7 @@ int FFmpegExtractor::stream_component_open(int stream_id)
     const void *data = NULL;
     size_t size = 0;
     int ret = 0;
+    int i = 0;
 
     ALOGD("[%s %d]stream_id: %d",__FUNCTION__,__LINE__, stream_id);
 
@@ -681,6 +845,7 @@ int FFmpegExtractor::stream_component_open(int stream_id)
 //    char tagbuf[32];
 //    av_get_codec_tag_string(tagbuf, sizeof(tagbuf), codec_param->codec_tag);
 //    ALOGV("Tag %s/0x%08x with codec(%s)\n", tagbuf, codec_param->codec_tag, avcodec_get_name(codec_param->codec_id));
+    ALOGD("%s %d ",__FUNCTION__,__LINE__);
 
     switch (codec_param->codec_type) {
         case AVMEDIA_TYPE_VIDEO: {
@@ -702,8 +867,8 @@ int FFmpegExtractor::stream_component_open(int stream_id)
     //        }
 
             if (codec_param->extradata) {
-                ALOGV("video stream extradata:");
-                //hexdump(codec_param->extradata, codec_param->extradata_size);
+                ALOGV("video stream extradata: codec_param->extradata_size %d",codec_param->extradata_size);
+                hexdump(codec_param->extradata, codec_param->extradata_size);
             } else {
                 ALOGV("video stream no extradata, but we can ignore it.");
             }
@@ -729,13 +894,14 @@ int FFmpegExtractor::stream_component_open(int stream_id)
                 mFirstTrack = track;
             }
             mLastTrack = track;
-            
+            ALOGD("%s %d ",__FUNCTION__,__LINE__);
             track->meta = AMediaFormat_new();
             track->timescale = 1000000;
             track->trackId = stream_id;
             track->mStream = mVideoStream;
+            const char* pMimeType = codecId2MimeType(mFormatCtx->streams[stream_id]->codec->codec_id);
             AMediaFormat_setInt32(track->meta, AMEDIAFORMAT_KEY_TRACK_ID, stream_id); 
-            AMediaFormat_setString(track->meta, AMEDIAFORMAT_KEY_MIME,  MEDIA_MIMETYPE_VIDEO_AVC);//"video/hevc");//mFormatCtx->streams[stream_id]->codec->codec_id); 
+            AMediaFormat_setString(track->meta, AMEDIAFORMAT_KEY_MIME, pMimeType);//"video/hevc");
             AMediaFormat_setInt32(track->meta, AMEDIAFORMAT_KEY_WIDTH,  mFormatCtx->streams[stream_id]->codec->width); 
             AMediaFormat_setInt32(track->meta, AMEDIAFORMAT_KEY_HEIGHT,  mFormatCtx->streams[stream_id]->codec->height); 
             if (mFormatCtx->streams[stream_id]->codec->bit_rate > 0){
@@ -743,7 +909,7 @@ int FFmpegExtractor::stream_component_open(int stream_id)
             }
 
             if (mFormatCtx->streams[stream_id]->codec->extradata_size > 0) {
-                ALOGD("%s %d have extradata");
+                ALOGD("%s %d have extradata",__FUNCTION__,__LINE__);
 //                meta->setData(kKeyRawCodecSpecificData, 0, avctx->extradata, avctx->extradata_size);
             }
             
@@ -776,8 +942,9 @@ int FFmpegExtractor::stream_component_open(int stream_id)
             track->timescale = 1000000;
             track->trackId = stream_id;
             track->mStream = mAudioStream;
+            const char* pMimeType =  codecId2MimeType(mFormatCtx->streams[stream_id]->codec->codec_id);
             AMediaFormat_setInt32(track->meta, AMEDIAFORMAT_KEY_TRACK_ID, stream_id); 
-            AMediaFormat_setString(track->meta, AMEDIAFORMAT_KEY_MIME,  MEDIA_MIMETYPE_AUDIO_AAC);//mFormatCtx->streams[stream_id]->codec->codec_id); 
+            AMediaFormat_setString(track->meta, AMEDIAFORMAT_KEY_MIME, pMimeType);
             AMediaFormat_setInt32(track->meta, AMEDIAFORMAT_KEY_CHANNEL_COUNT,  mFormatCtx->streams[stream_id]->codec->channels); 
             AMediaFormat_setInt32(track->meta, AMEDIAFORMAT_KEY_BITS_PER_SAMPLE,  mFormatCtx->streams[stream_id]->codec->bits_per_coded_sample); 
             AMediaFormat_setInt32(track->meta, AMEDIAFORMAT_KEY_BIT_RATE, mFormatCtx->streams[stream_id]->codec->bit_rate); 

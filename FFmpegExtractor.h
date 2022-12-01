@@ -34,7 +34,6 @@ extern "C" {
 
 //#include "config.h"
 #include "libavformat/avformat.h"
-#include "libavcodec/avcodec.h"
 #include "libavutil/avstring.h"
 //#include "libavutil/colorspace.h"
 #include "libavutil/mathematics.h"
@@ -44,14 +43,19 @@ extern "C" {
 #include "libavutil/parseutils.h"
 #include "libavutil/samplefmt.h"
 #include "libavutil/avassert.h"
-//#include "libavdevice/avdevice.h"
-#include "libswscale/swscale.h"
 #include "libavutil/opt.h"
 //#include "libavutil/internal.h"
+
+#include "libswresample/swresample.h"
+
+//#include "libavdevice/avdevice.h"
+#include "libswscale/swscale.h"
+
 #include "libavcodec/avfft.h"
 //#include "libavcodec/xiph.h"
-#include "libswresample/swresample.h"
+
 #include "libavcodec/avcodec.h"
+#include "libavcodec/codec_id.h"
 
 #ifdef __cplusplus
 }
@@ -83,6 +87,20 @@ typedef struct
     size_t size; 
     size_t offset;
 }buffer_data;
+
+typedef struct
+{
+    enum AVCodecID id;
+    char *name; 
+    char *mime;
+}codecId2MimeTpye;
+
+
+typedef struct
+{
+    bool is_annexb;
+    AVBSFContext *bsf_ctx;
+}Ffmpeg_stream_info;
 
 void packet_queue_init(PacketQueue *q);
 void packet_queue_destroy(PacketQueue *q);
@@ -154,9 +172,11 @@ private:
 int mVideoStreamIdx;
 int mAudioStreamIdx;
 size_t mProbePkts;
+Ffmpeg_stream_info mStream_info;
 
 bool mEOF;
 AVFormatContext *mFormatCtx;
+AVBSFContext *bsf_ctx;
 bool mFFmpegInited;
 AVStream *mVideoStream;
 AVStream *mAudioStream;
@@ -176,6 +196,8 @@ void deInitStreams();
 static int decode_interrupt_cb(void *ctx);
 void initFFmpegDefaultOpts();
 int stream_component_open(int stream_index);
+int open_bitstream_filter(AVStream *stream, AVBSFContext **bsf_ctx, const char *name);
+
 status_t readMetaData();
 
 //yangwen add endd
