@@ -7,8 +7,7 @@ LOCAL_SRC_FILES := \
 	FFmpegExtractor.cpp
 
 LOCAL_C_INCLUDES += \
-	$(TOP)/vendor/xingji/frameworks/multimedia/mediaserver_extension/ffmpeg \
-	$(TOP)/vendor/xingji/frameworks/multimedia/mediaserver_extension/ffmpeg/ffmpeg_prebuild/include \
+	$(TOP)/vendor/flyme/frameworks/media/ffmpeg4android/ffmpeg_prebuild/include \
 	$(TOP)/frameworks/native/include/media/openmax \
 	$(TOP)/frameworks/av/include \
 	$(TOP)/frameworks/av/media/libstagefright \
@@ -26,8 +25,9 @@ LOCAL_SHARED_LIBRARIES := \
 	libstagefright_foundation
 
 
-LOCAL_MODULE := libffmpegextractor
-
+LOCAL_MODULE := libffmpeg_extractor
+LOCAL_SYSTEM_EXT_MODULE := true
+LOCAL_MODULE_RELATIVE_PATH  := extractors
 LOCAL_MODULE_TAGS := optional
 
 LOCAL_CFLAGS += -D__STDC_CONSTANT_MACROS=1

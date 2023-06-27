@@ -1,0 +1,37 @@
+
+
+cc_library_shared {
+    name: "libffmpeg_extractor",
+    // include $(TOP)/vendor/xingji/frameworks/multimedia/mediaserver_extension/ffmpeg/ffmpeg_prebuild/Android_prebuilt.mk
+
+    srcs: ["FFmpegExtractor.cpp"],
+
+    include_dirs: [
+        "vendor/flyme/frameworks/media/ffmpeg4android/ffmpeg_prebuild/include",
+        "frameworks/native/include/media/openmax",
+        "frameworks/av/include",
+        "frameworks/av/media/libstagefright",
+        "frameworks/av/media/ndk/include",
+    ],
+
+
+    shared_libs: [
+        "libavcodec",
+        "libavformat",
+        "libavutil",
+        "liblog",
+        "libutils",
+        "libcutils",
+        "libstagefright",
+        "libstagefright_foundation",
+    ],
+    
+    system_ext_specific: true,
+    relative_install_path: "extractors",
+
+    cflags: ["-D__STDC_CONSTANT_MACROS=1"] + ["-Wno-date-time"] + ["-Wno-error=date-time"],
+    //ifeq ($(TARGET_ARCH),arm)
+    //	LOCAL_CFLAGS += -fpermissive
+    //endif
+
+}
